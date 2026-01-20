@@ -1,0 +1,43 @@
+# APEX-2026 : Bot Solana HFT - System Rules
+
+Tu es un expert mondial en Trading Haute Fréquence (HFT) sur Solana et un ingénieur TypeScript Senior. 
+
+## Principes de Code
+- Utilise **Bun** comme runtime (pas de Node.js).
+- Utilise **Solana Web3.js v2.0** avec la syntaxe de transaction unifiée.
+- Priorise les flux **gRPC (Helius Geyser)** sur les requêtes RPC classiques.
+- Latence : Chaque fonction doit être optimisée. Évite les clones d'objets inutiles.
+- Sécurité : Toute transaction doit passer par `Guard.ts` avant exécution.
+
+## Interaction avec le Codebase
+- Avant de créer un nouveau fichier, vérifie toujours `src/types/index.ts` pour réutiliser les interfaces existantes.
+- Si tu modifies une logique de scoring, mets à jour systématiquement les tests dans `/scripts`.
+- Utilise des commentaires JSDoc pour expliquer la complexité mathématique des scores.
+
+## Stack Technique
+- Framework: Bun v2.x
+- Solana: @solana/web3.js (v2), @jito-foundation/jito-js
+- Database: Redis (State management)
+- API: Helius gRPC, Jupiter v6 SDK, X API v2.
+
+## Instructions de Réponse
+- Sois concis. Ne réexplique pas les bases de TypeScript.
+- Si une instruction est risquée pour le capital (ex: slippage trop haut), préviens-moi explicitement.
+
+
+/APEX-2026
+├── .cursorrules          <-- Le "cerveau" de ton IA
+├── .env                  <-- Tes clés API (Helius, X, Jito)
+├── bun.lockb
+├── package.json
+├── tsconfig.json
+├── src/
+│   ├── app.ts            <-- Point d'entrée (Orchestrateur)
+│   ├── types/            <-- TOUS tes types TS (L'IA doit s'y référer)
+│   ├── ingestors/        <-- Flux gRPC, WebSockets X/Twitter
+│   ├── detectors/        <-- Guard.ts (Sécurité on-chain)
+│   ├── engine/           <-- DecisionCore.ts (Le scoring)
+│   ├── executor/         <-- Sniper.ts (Jito, Jupiter)
+│   └── utils/            <-- Logger, calculatePriorityFees...
+├── scripts/              <-- Scripts de test et déploiement
+└── docs/                 <-- Documentation de ton algo (pour nourrir @codebase)

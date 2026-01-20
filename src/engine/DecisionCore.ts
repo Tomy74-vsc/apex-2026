@@ -1,12 +1,14 @@
 import { EventEmitter } from 'events';
 import { MarketScanner } from '../ingestors/MarketScanner.js';
 import { Guard } from '../detectors/Guard.js';
-import type { MarketEvent, SecurityReport, ScoredToken } from '../types/index.js';
+import { SocialPulse } from '../ingestors/SocialPulse.js';
+import type { MarketEvent, SecurityReport, ScoredToken, SocialSignal } from '../types/index.js';
 
 /**
  * Événements émis par le DecisionCore
  */
 export interface DecisionCoreEvents {
+  'tokenDetected': (mint: string) => void;
   'tokenScored': (token: ScoredToken) => void;
   'readyToSnipe': (token: ScoredToken) => void;
   'tokenRejected': (mint: string, reason: string) => void;
@@ -20,6 +22,7 @@ export interface DecisionCoreOptions {
   maxRiskScore?: number; // Score de risque max acceptable (défaut: 50)
   fastCheckThreshold?: number; // Threshold pour FastCheck (défaut: 100 SOL)
   enableFastCheck?: boolean; // Active/désactive FastCheck (défaut: true)
+  socialPulse?: SocialPulse; // Instance de SocialPulse pour signaux sociaux
 }
 
 /**
@@ -31,6 +34,7 @@ export interface DecisionCoreOptions {
 export class DecisionCore extends EventEmitter {
   private scanner: MarketScanner;
   private guard: Guard;
+  private socialPulse: SocialPulse | null;
   private minLiquidity: number;
   private maxRiskScore: number;
   private enableFastCheck: boolean;
@@ -44,6 +48,7 @@ export class DecisionCore extends EventEmitter {
     this.minLiquidity = options.minLiquidity || 5;
     this.maxRiskScore = options.maxRiskScore || 50;
     this.enableFastCheck = options.enableFastCheck !== false;
+    this.socialPulse = options.socialPulse || null;
 
     // Initialise les composants
     this.scanner = new MarketScanner({
@@ -62,12 +67,14 @@ export class DecisionCore extends EventEmitter {
   private setupScannerEvents(): void {
     // Événement standard : nouveau token détecté
     this.scanner.on('newToken', async (event: MarketEvent) => {
+      this.emit('tokenDetected', event.token.mint);
       await this.processToken(event, false);
     });
 
     // FastCheck : priorité absolue pour haute liquidité
     if (this.enableFastCheck) {
       this.scanner.on('fastCheck', async (event: MarketEvent) => {
+        this.emit('tokenDetected', event.token.mint);
         console.log('⚡ FastCheck déclenché pour:', event.token.mint);
         await this.processToken(event, true);
       });
@@ -145,8 +152,13 @@ export class DecisionCore extends EventEmitter {
         return;
       }
 
-      // Calcule le score final
-      const finalScore = this.calculateFinalScore(event, security, isFastCheck);
+      // Récupère les signaux sociaux (si SocialPulse disponible)
+      const socialSignal = this.socialPulse 
+        ? await this.socialPulse.getSignal(token.mint)
+        : null;
+
+      // Calcule le score final (inclut social signals si disponibles)
+      const finalScore = this.calculateFinalScore(event, security, socialSignal, isFastCheck);
 
       // Détermine la priorité
       const priority = this.determinePriority(finalScore, initialLiquiditySol, isFastCheck);
@@ -154,7 +166,7 @@ export class DecisionCore extends EventEmitter {
       // Crée le ScoredToken
       const scoredToken: ScoredToken = {
         ...event,
-        social: null, // TODO: Intégrer social signals
+        social: socialSignal,
         security,
         finalScore,
         priority,
@@ -182,12 +194,14 @@ export class DecisionCore extends EventEmitter {
    * 
    * @param event - MarketEvent
    * @param security - SecurityReport du Guard
+   * @param socialSignal - SocialSignal de SocialPulse (peut être null)
    * @param isFastCheck - True si FastCheck
    * @returns Score de 0 à 100
    */
   private calculateFinalScore(
     event: MarketEvent,
     security: SecurityReport,
+    socialSignal: SocialSignal | null,
     isFastCheck: boolean
   ): number {
     let score = 0;
@@ -213,7 +227,22 @@ export class DecisionCore extends EventEmitter {
       score += 5;
     }
 
-    // 5. Bonus FastCheck (5 points)
+    // 5. Score social (20 points max si disponible)
+    if (socialSignal) {
+      // Velocity boost (10 points max)
+      const velocityScore = Math.min(10, socialSignal.velocity30s * 0.4);
+      score += velocityScore;
+
+      // Trust score boost (5 points max)
+      const trustScore = (socialSignal.authorTrustScore / 100) * 5;
+      score += trustScore;
+
+      // Sentiment boost (5 points max)
+      const sentimentScore = Math.max(0, socialSignal.sentiment * 5);
+      score += sentimentScore;
+    }
+
+    // 6. Bonus FastCheck (5 points)
     if (isFastCheck) {
       score += 5;
     }

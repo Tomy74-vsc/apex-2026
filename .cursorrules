@@ -4,7 +4,7 @@ Tu es un expert mondial en Trading Haute Fréquence (HFT) sur Solana et un ingé
 
 ## Principes de Code
 - Utilise **Bun** comme runtime (pas de Node.js).
-- Utilise **Solana Web3.js v2.0** avec la syntaxe de transaction unifiée.
+- Utilise **Solana Web3.js v1.x** (stable et compatible écosystème).
 - Priorise les flux **gRPC (Helius Geyser)** sur les requêtes RPC classiques.
 - Latence : Chaque fonction doit être optimisée. Évite les clones d'objets inutiles.
 - Sécurité : Toute transaction doit passer par `Guard.ts` avant exécution.
@@ -16,9 +16,9 @@ Tu es un expert mondial en Trading Haute Fréquence (HFT) sur Solana et un ingé
 
 ## Stack Technique
 - Framework: Bun v2.x
-- Solana: @solana/web3.js (v2), @jito-foundation/jito-js
+- Solana: @solana/web3.js (v1.x stable), jito-ts
 - Database: Redis (State management)
-- API: Helius gRPC, Jupiter v6 SDK, X API v2.
+- API: Helius gRPC, Jupiter v6 REST API, X API v2.
 
 ## Instructions de Réponse
 - Sois concis. Ne réexplique pas les bases de TypeScript.

@@ -1,22 +1,18 @@
 {
   "name": "bot-trading",
-  "module": "index.ts",
+  "module": "src/app.ts",
   "type": "module",
   "private": true,
   "devDependencies": {
-    "@types/bun": "latest",
-    "@types/node": "^25.0.9"
+    "@types/bun": "latest"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "dependencies": {
-    "@jup-ag/api": "^6.0.48",
-    "@solana/spl-token": "^0.4.14",
-    "@solana/web3.js": "^1.98.4",
-    "@solsdk/jito-ts": "^4.2.2",
-    "axios": "^1.13.2",
-    "dotenv": "^17.2.3",
-    "ioredis": "^5.9.2"
+    "ioredis": "^5.4.1",
+    "@solana/web3.js": "^1.95.8",
+    "jito-ts": "^3.0.1",
+    "bs58": "^5.0.0"
   }
 }

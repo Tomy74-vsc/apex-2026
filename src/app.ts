@@ -52,7 +52,7 @@ class APEXBot {
   private socialPulse: SocialPulse;
   private sniper: Sniper | null = null;
   private stats: AppStats;
-  private dashboardInterval: Timer | null = null;
+  private dashboardInterval: ReturnType<typeof setInterval> | null = null;
   private isShuttingDown: boolean = false;
 
   constructor(config: AppConfig) {

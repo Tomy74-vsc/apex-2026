@@ -1,4 +1,5 @@
-import { Connection, PublicKey, VersionedTransactionResponse } from '@solana/web3.js';
+import { Connection, PublicKey } from '@solana/web3.js';
+import type { VersionedTransactionResponse } from '@solana/web3.js';
 import { EventEmitter } from 'events';
 import { getMint } from '@solana/spl-token';
 import type { MarketEvent, TokenMetadata } from '../types/index.js';
@@ -59,7 +60,7 @@ export class MarketScanner extends EventEmitter {
   private cacheSize: number;
   private cacheTtlMs: number;
   private isRunning: boolean = false;
-  private cacheCleanupInterval: Timer | null = null;
+  private cacheCleanupInterval: ReturnType<typeof setInterval> | null = null;
   private reconnectBackoffMs = 1000; // Backoff exponentiel pour reconnexion gRPC
 
   constructor(options: MarketScannerOptions = {}) {
@@ -421,8 +422,8 @@ export class MarketScanner extends EventEmitter {
 
       // Les mints sont généralement dans les comptes 5 et 6
       if (accountKeys.length >= 7) {
-        baseMint = accountKeys[5];
-        quoteMint = accountKeys[6];
+        baseMint = accountKeys[5] || null;
+        quoteMint = accountKeys[6] || null;
       }
 
       if (!baseMint || !quoteMint) {
@@ -518,7 +519,9 @@ export class MarketScanner extends EventEmitter {
 
       if (solVaultIndex < meta.postBalances.length) {
         const solBalance = meta.postBalances[solVaultIndex];
-        return solBalance / 1e9; // Lamports vers SOL
+        if (solBalance !== undefined) {
+          return solBalance / 1e9; // Lamports vers SOL
+        }
       }
 
       return 0;

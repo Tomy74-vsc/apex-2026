@@ -6,8 +6,8 @@ import {
   TransactionMessage,
   AddressLookupTableAccount,
 } from '@solana/web3.js';
-import { SearcherClient } from 'jito-ts/dist/sdk/block-engine/searcher.js';
-import { Bundle } from 'jito-ts/dist/sdk/block-engine/types.js';
+import { searcherClient, SearcherClient } from 'jito-ts/src/sdk/block-engine/searcher.js';
+import { Bundle } from 'jito-ts/src/sdk/block-engine/types.js';
 import type { ScoredToken, ExecutionBundle } from '../types/index.js';
 import bs58 from 'bs58';
 
@@ -81,7 +81,7 @@ export class Sniper {
     this.jitoAuthKeypair = config.jitoAuthKeypair;
     
     // Initialise Jito Searcher Client
-    this.jitoClient = new SearcherClient(
+    this.jitoClient = searcherClient(
       config.jitoBlockEngineUrl,
       this.jitoAuthKeypair
     );
@@ -176,7 +176,7 @@ export class Sniper {
         return null;
       }
 
-      const quote: JupiterQuoteResponse = await response.json();
+      const quote = await response.json() as JupiterQuoteResponse;
       return quote;
     } catch (error) {
       console.error('[Sniper] Erreur getJupiterQuote:', error);
@@ -211,7 +211,8 @@ export class Sniper {
         return null;
       }
 
-      const { swapTransaction }: JupiterSwapResponse = await response.json();
+      const swapResponse = await response.json() as JupiterSwapResponse;
+      const { swapTransaction } = swapResponse;
 
       // Désérialiser la transaction
       const txBuffer = Buffer.from(swapTransaction, 'base64');
@@ -235,9 +236,12 @@ export class Sniper {
    */
   private async createJitoTipTransaction(tipLamports: number): Promise<VersionedTransaction> {
     // Sélectionne un tip account aléatoire (load balancing)
-    const randomTipAccount = this.JITO_TIP_ACCOUNTS[
-      Math.floor(Math.random() * this.JITO_TIP_ACCOUNTS.length)
-    ];
+    const randomIndex = Math.floor(Math.random() * this.JITO_TIP_ACCOUNTS.length);
+    const randomTipAccount = this.JITO_TIP_ACCOUNTS[randomIndex];
+
+    if (!randomTipAccount) {
+      throw new Error('Aucun tip account Jito disponible');
+    }
 
     const tipAccount = new PublicKey(randomTipAccount);
 
@@ -254,14 +258,14 @@ export class Sniper {
     const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash('confirmed');
 
     // Crée le message de transaction
-    const message = TransactionMessage.compile({
+    const messageV0 = new TransactionMessage({
       payerKey: this.wallet.publicKey,
-      instructions: [transferIx],
       recentBlockhash: blockhash,
-    });
+      instructions: [transferIx],
+    }).compileToV0Message();
 
     // Crée et signe la transaction
-    const tx = new VersionedTransaction(message);
+    const tx = new VersionedTransaction(messageV0);
     tx.sign([this.wallet]);
 
     return tx;
@@ -314,13 +318,8 @@ export class Sniper {
    */
   private async sendJitoBundle(bundle: ExecutionBundle): Promise<string | null> {
     try {
-      // Sérialise les transactions pour Jito
-      const serializedTxs = bundle.transactions.map((tx) =>
-        bs58.encode(tx.serialize())
-      );
-
-      // Crée le bundle Jito
-      const jitoBundle = new Bundle(serializedTxs, bundle.transactions.length);
+      // Crée le bundle Jito (le constructeur prend directement VersionedTransaction[])
+      const jitoBundle = new Bundle(bundle.transactions, bundle.transactions.length);
 
       // Envoie au Block Engine
       const bundleId = await this.jitoClient.sendBundle(jitoBundle);
@@ -329,9 +328,20 @@ export class Sniper {
 
       // Retourne la signature de la première transaction (swap)
       // Note: en prod, implémenter un système de tracking du bundle
-      const signature = bs58.encode(bundle.transactions[0].signatures[0]);
+      if (bundle.transactions.length === 0) {
+        console.error('[Sniper] ❌ Aucune transaction dans le bundle');
+        return null;
+      }
       
-      return signature;
+      const firstTx = bundle.transactions[0]!; // Non-null assertion car on vérifie length > 0
+      const firstSignature = firstTx.signatures[0];
+      
+      if (!firstSignature) {
+        console.error('[Sniper] ❌ Aucune signature trouvée sur la première transaction');
+        return null;
+      }
+      
+      return bs58.encode(firstSignature);
     } catch (error) {
       console.error('[Sniper] Erreur sendJitoBundle:', error);
       return null;

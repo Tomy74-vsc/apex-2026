@@ -116,6 +116,16 @@ export class DecisionCore extends EventEmitter {
   }
 
   /**
+   * Traite un MarketEvent externe (depuis PumpScanner ou autres sources)
+   * 
+   * @param event - Événement MarketEvent
+   * @param isFastCheck - True si c'est un FastCheck (priorité absolue)
+   */
+  async processMarketEvent(event: MarketEvent, isFastCheck: boolean = false): Promise<void> {
+    await this.processToken(event, isFastCheck);
+  }
+
+  /**
    * Traite un token détecté
    * 
    * @param event - Événement MarketEvent du scanner

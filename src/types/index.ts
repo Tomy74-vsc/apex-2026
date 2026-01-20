@@ -23,6 +23,8 @@ export interface SocialSignal {
   followerCount: number;
   velocity30s: number; // Mentions par 30s
   sentiment: number; // -1 to 1
+  rawMessage?: string; // Message brut (pour Telegram notamment)
+  channelId?: string; // ID du canal/channel (pour Telegram notamment)
 }
 
 export interface SecurityReport {

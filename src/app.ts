@@ -4,8 +4,9 @@
  * APEX-2026 - Point d'entrée principal du Bot HFT Solana
  * 
  * Orchestre tous les composants :
- * - MarketScanner : Détection temps réel des nouveaux pools
- * - SocialPulse : Signaux sociaux X (Twitter)
+ * - MarketScanner : Détection temps réel des nouveaux pools Raydium
+ * - PumpScanner : Détection temps réel des nouveaux tokens Pump.fun
+ * - TelegramPulse : Signaux sociaux Telegram
  * - Guard : Analyse de sécurité on-chain
  * - DecisionCore : Scoring et décision de trade
  * - Sniper : Exécution via Jito + Jupiter
@@ -14,9 +15,10 @@
 import { Keypair } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { DecisionCore } from './engine/DecisionCore.js';
-import { SocialPulse } from './ingestors/SocialPulse.js';
+import { TelegramPulse } from './ingestors/TelegramPulse.js';
+import { PumpScanner } from './ingestors/PumpScanner.js';
 import { Sniper } from './executor/Sniper.js';
-import type { ScoredToken } from './types/index.js';
+import type { ScoredToken, MarketEvent } from './types/index.js';
 
 /**
  * Configuration depuis variables d'environnement
@@ -24,7 +26,6 @@ import type { ScoredToken } from './types/index.js';
 interface AppConfig {
   rpcUrl: string;
   wsUrl: string;
-  redisUrl: string;
   walletPrivateKey: string;
   jitoAuthPrivateKey: string;
   jitoBlockEngineUrl: string;
@@ -32,6 +33,9 @@ interface AppConfig {
   slippageBps: number;
   minLiquidity: number;
   maxRiskScore: number;
+  telegramApiId?: number;
+  telegramApiHash?: string;
+  telegramSessionString?: string;
 }
 
 /**
@@ -49,7 +53,8 @@ interface AppStats {
  */
 class APEXBot {
   private decisionCore: DecisionCore;
-  private socialPulse: SocialPulse;
+  private telegramPulse: TelegramPulse | null = null;
+  private pumpScanner: PumpScanner | null = null;
   private sniper: Sniper | null = null;
   private stats: AppStats;
   private dashboardInterval: ReturnType<typeof setInterval> | null = null;
@@ -64,14 +69,40 @@ class APEXBot {
       startTime: Date.now(),
     };
 
-    // Initialise SocialPulse
-    this.socialPulse = new SocialPulse(config.redisUrl);
+    // Initialise TelegramPulse si les clés sont disponibles
+    if (config.telegramApiId && config.telegramApiHash) {
+      try {
+        this.telegramPulse = new TelegramPulse({
+          apiId: config.telegramApiId,
+          apiHash: config.telegramApiHash,
+          sessionString: config.telegramSessionString,
+        });
+        console.log('✅ TelegramPulse initialisé');
+      } catch (error) {
+        console.error('⚠️  Erreur initialisation TelegramPulse:', error);
+        console.log('⚠️  TelegramPulse désactivé');
+      }
+    } else {
+      console.log('⚠️  TELEGRAM_API_ID ou TELEGRAM_API_HASH manquants');
+      console.log('⚠️  TelegramPulse désactivé');
+    }
 
-    // Initialise DecisionCore avec SocialPulse
+    // Initialise PumpScanner
+    try {
+      this.pumpScanner = new PumpScanner({
+        rpcUrl: config.rpcUrl,
+        fastCheckThreshold: 30, // 30 SOL pour Pump.fun
+      });
+      console.log('✅ PumpScanner initialisé');
+    } catch (error) {
+      console.error('⚠️  Erreur initialisation PumpScanner:', error);
+      console.log('⚠️  PumpScanner désactivé');
+    }
+
+    // Initialise DecisionCore (sans SocialPulse pour l'instant)
     this.decisionCore = new DecisionCore({
       minLiquidity: config.minLiquidity,
       maxRiskScore: config.maxRiskScore,
-      socialPulse: this.socialPulse,
     });
 
     // Initialise Sniper si les clés sont disponibles
@@ -151,6 +182,43 @@ class APEXBot {
       this.stats.tokensDetected++;
       // mint parameter available for future use (logging, debugging, etc.)
     });
+
+    // Événement : Signal Telegram détecté
+    if (this.telegramPulse) {
+      this.telegramPulse.on('newSignal', (signal) => {
+        console.log(`📨 TELEGRAM SIGNAL: ${signal.mint} (score: ${signal.score})`);
+        // Émet tokenDetected pour déclencher l'analyse
+        this.decisionCore.emit('tokenDetected', signal.mint);
+        this.stats.tokensDetected++;
+      });
+
+      this.telegramPulse.on('error', (error) => {
+        console.error('[TelegramPulse] ❌ Erreur:', error);
+      });
+    }
+
+    // Événement : Nouveau launch Pump.fun
+    if (this.pumpScanner) {
+      this.pumpScanner.on('newLaunch', async (event: MarketEvent) => {
+        console.log(`🚀 [PumpScanner] NewLaunch: ${event.token.mint}`);
+        this.decisionCore.emit('tokenDetected', event.token.mint);
+        this.stats.tokensDetected++;
+        // Traite l'événement via DecisionCore
+        await this.decisionCore.processMarketEvent(event, false);
+      });
+
+      this.pumpScanner.on('fastCheck', async (event: MarketEvent) => {
+        console.log(`⚡ [PumpScanner] FastCheck: ${event.token.mint}`);
+        this.decisionCore.emit('tokenDetected', event.token.mint);
+        this.stats.tokensDetected++;
+        // Traite l'événement avec priorité FastCheck
+        await this.decisionCore.processMarketEvent(event, true);
+      });
+
+      this.pumpScanner.on('error', (error) => {
+        console.error('[PumpScanner] ❌ Erreur:', error);
+      });
+    }
   }
 
   /**
@@ -162,15 +230,36 @@ class APEXBot {
     console.log('╚══════════════════════════════════════════════════════════╝\n');
 
     try {
-      // Connecte Redis (SocialPulse)
-      console.log('🔌 Connexion à Redis...');
-      await this.socialPulse.connect();
-      console.log('✅ Redis connecté\n');
-
       // Démarre DecisionCore (qui démarre MarketScanner)
       console.log('🚀 Démarrage du DecisionCore...');
       await this.decisionCore.start();
       console.log('✅ DecisionCore démarré\n');
+
+      // Démarre TelegramPulse (avec gestion d'erreurs pour interaction utilisateur)
+      if (this.telegramPulse) {
+        try {
+          console.log('📱 Démarrage de TelegramPulse...');
+          await this.telegramPulse.start();
+          console.log('✅ TelegramPulse démarré\n');
+        } catch (error) {
+          console.error('⚠️  Erreur lors du démarrage TelegramPulse:', error);
+          console.log('⚠️  TelegramPulse désactivé (peut nécessiter login interactif)\n');
+          this.telegramPulse = null;
+        }
+      }
+
+      // Démarre PumpScanner
+      if (this.pumpScanner) {
+        try {
+          console.log('🚀 Démarrage de PumpScanner...');
+          await this.pumpScanner.start();
+          console.log('✅ PumpScanner démarré\n');
+        } catch (error) {
+          console.error('⚠️  Erreur lors du démarrage PumpScanner:', error);
+          console.log('⚠️  PumpScanner désactivé\n');
+          this.pumpScanner = null;
+        }
+      }
 
       // Démarre le tableau de bord
       this.startDashboard();
@@ -213,12 +302,24 @@ class APEXBot {
       console.error('❌ Erreur lors de l\'arrêt du DecisionCore:', error);
     }
 
-    // Déconnecte Redis
-    try {
-      await this.socialPulse.disconnect();
-      console.log('✅ Redis déconnecté');
-    } catch (error) {
-      console.error('❌ Erreur lors de la déconnexion Redis:', error);
+    // Arrête PumpScanner
+    if (this.pumpScanner) {
+      try {
+        await this.pumpScanner.stop();
+        console.log('✅ PumpScanner arrêté');
+      } catch (error) {
+        console.error('❌ Erreur lors de l\'arrêt PumpScanner:', error);
+      }
+    }
+
+    // Arrête TelegramPulse
+    if (this.telegramPulse) {
+      try {
+        await this.telegramPulse.stop();
+        console.log('✅ TelegramPulse arrêté');
+      } catch (error) {
+        console.error('❌ Erreur lors de l\'arrêt TelegramPulse:', error);
+      }
     }
 
     console.log('✅ Arrêt terminé');
@@ -249,7 +350,8 @@ class APEXBot {
     const uptimeSeconds = Math.floor((uptime % 60000) / 1000);
 
     const decisionStats = this.decisionCore.getStats();
-    const socialStats = this.socialPulse.getStats();
+    const telegramStats = this.telegramPulse?.getStats();
+    const pumpStats = this.pumpScanner?.getStats();
 
     console.log('\n' + '═'.repeat(60));
     console.log(isFinal ? '📊 STATISTIQUES FINALES' : '📊 TABLEAU DE BORD');
@@ -267,10 +369,17 @@ class APEXBot {
     console.log(`   Rejetés: ${decisionStats.tokensRejected}`);
     console.log(`   Taux d'acceptation: ${decisionStats.acceptanceRate.toFixed(2)}%`);
     console.log('');
-    console.log('📱 SocialPulse:');
-    console.log(`   Mints trackés: ${socialStats.trackedMints}`);
-    console.log(`   Mentions totales: ${socialStats.totalMentions}`);
-    console.log(`   Redis: ${socialStats.redisConnected ? '✅ Connecté' : '❌ Déconnecté'}`);
+    console.log('📱 TelegramPulse:');
+    console.log(`   Status: ${telegramStats ? (telegramStats.isRunning ? '✅ Actif' : '❌ Inactif') : '⚠️  Non initialisé'}`);
+    if (telegramStats) {
+      console.log(`   Session: ${telegramStats.hasSession ? '✅ Sauvegardée' : '❌ Non sauvegardée'}`);
+    }
+    console.log('');
+    console.log('🚀 PumpScanner:');
+    console.log(`   Status: ${pumpStats ? (pumpStats.isRunning ? '✅ Actif' : '❌ Inactif') : '⚠️  Non initialisé'}`);
+    if (pumpStats) {
+      console.log(`   Transactions traitées: ${pumpStats.processedCount}`);
+    }
     console.log('');
     console.log('🎯 Sniper:');
     console.log(`   Status: ${this.sniper ? '✅ Actif' : '⚠️  Inactif'}`);
@@ -305,10 +414,19 @@ function loadConfig(): AppConfig {
     throw new Error('HELIUS_WS_URL ou WS_URL doit être défini dans .env');
   }
 
+  // Vérifie les clés Telegram
+  const telegramApiId = process.env.TELEGRAM_API_ID;
+  const telegramApiHash = process.env.TELEGRAM_API_HASH;
+  const telegramSessionString = process.env.TELEGRAM_SESSION_STRING;
+
+  if (!telegramApiId || !telegramApiHash) {
+    console.warn('⚠️  TELEGRAM_API_ID ou TELEGRAM_API_HASH manquants dans .env');
+    console.warn('⚠️  TelegramPulse sera désactivé');
+  }
+
   return {
     rpcUrl,
     wsUrl,
-    redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
     walletPrivateKey: process.env.WALLET_PRIVATE_KEY || '',
     jitoAuthPrivateKey: process.env.JITO_AUTH_PRIVATE_KEY || '',
     jitoBlockEngineUrl: process.env.JITO_BLOCK_ENGINE_URL || 'https://mainnet.block-engine.jito.wtf',
@@ -316,6 +434,9 @@ function loadConfig(): AppConfig {
     slippageBps: parseInt(process.env.SLIPPAGE_BPS || '300'),
     minLiquidity: parseFloat(process.env.MIN_LIQUIDITY || '5'),
     maxRiskScore: parseInt(process.env.MAX_RISK_SCORE || '50'),
+    telegramApiId: telegramApiId ? parseInt(telegramApiId) : undefined,
+    telegramApiHash: telegramApiHash || undefined,
+    telegramSessionString: telegramSessionString || undefined,
   };
 }
 

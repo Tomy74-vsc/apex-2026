@@ -15,7 +15,7 @@ Tu es un expert mondial en Trading Haute Fréquence (HFT) sur Solana et un ingé
 - Utilise des commentaires JSDoc pour expliquer la complexité mathématique des scores.
 
 ## Stack Technique
-- Framework: Bun v2.x
+- Framework: Bun v1.3.10
 - Solana: @solana/web3.js (v1.x stable), jito-ts
 - Database: Redis (State management)
 - API: Helius gRPC, Jupiter v6 REST API, X API v2.

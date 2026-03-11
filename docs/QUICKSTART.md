@@ -3,7 +3,8 @@
 ## Installation
 
 ### 1. Prérequis
-- **Bun** v1.3.6+ (pas de Node.js)
+- **Bun** `1.3.10` (runtime principal, pas de Node.js)
+- **TypeScript** `5.9.3` (installé via dépendances de dev du repo)
 - **Clé API Helius** avec WebSocket support
 - **Solana Mainnet** access
 
@@ -12,6 +13,8 @@
 ```bash
 cd "c:\Users\tomre\bot trading"
 bun install
+bun --version
+bun run typecheck
 ```
 
 ### 3. Configuration
@@ -30,6 +33,22 @@ HELIUS_WS_URL=wss://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY
 ```
 
 ⚠️ **Important** : Remplacez `YOUR_API_KEY` par votre vraie clé Helius.
+
+### État de compilation
+
+Cette migration vise des versions stables et reproductibles de Bun et TypeScript.
+Elle ne promet pas qu'un typecheck rouge existant devient vert si le blocage vient du code applicatif ou d'une dépendance tierce.
+
+### Incompatibilités connues après migration
+
+- `jito-ts@3.0.1` provoque encore des erreurs TypeScript avec la configuration actuelle.
+- `src/detectors/Guard.ts` contient encore des erreurs de typage applicatives.
+- Le runtime cible documenté est `Bun 1.3.10`, mais les vérifications locales restent dépendantes de la version Bun effectivement installée sur la machine.
+
+### Sécurité d'exécution
+
+Le live trading est désactivé par défaut.
+Pour autoriser l'exécution réelle, il faut définir explicitement `TRADING_ENABLED=true` dans `.env`.
 
 ## Tests Individuels
 

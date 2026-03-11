@@ -134,7 +134,6 @@ export class Guard {
     try {
       // Récupère tous les token accounts pour ce mint
       // Offset 0 = mint address dans un token account
-      const mintBytes = mintPubkey.toBytes();
       const tokenAccounts = await this.connection.getProgramAccounts(TOKEN_PROGRAM_ID, {
         filters: [
           {
@@ -143,7 +142,7 @@ export class Guard {
           {
             memcmp: {
               offset: 0, // Mint address offset dans token account
-              bytes: mintBytes,
+              bytes: mintPubkey.toBase58(),
             },
           },
         ],
@@ -248,7 +247,6 @@ export class Guard {
             userPublicKey: dummyPublicKey.toBase58(),
             wrapAndUnwrapSol: true,
             dynamicComputeUnitLimit: true,
-            prioritizationFeeLamports: 'auto',
           },
         });
 

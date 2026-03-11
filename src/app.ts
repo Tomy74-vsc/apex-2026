@@ -26,6 +26,7 @@ import type { ScoredToken, MarketEvent } from './types/index.js';
 interface AppConfig {
   rpcUrl: string;
   wsUrl: string;
+  tradingEnabled: boolean;
   walletPrivateKey: string;
   jitoAuthPrivateKey: string;
   jitoBlockEngineUrl: string;
@@ -105,8 +106,8 @@ class APEXBot {
       maxRiskScore: config.maxRiskScore,
     });
 
-    // Initialise Sniper si les clés sont disponibles
-    if (config.walletPrivateKey && config.jitoAuthPrivateKey) {
+    // Initialise Sniper seulement si le live trading est explicitement activé
+    if (config.tradingEnabled && config.walletPrivateKey && config.jitoAuthPrivateKey) {
       try {
         const walletKeypair = Keypair.fromSecretKey(bs58.decode(config.walletPrivateKey));
         const jitoAuthKeypair = Keypair.fromSecretKey(bs58.decode(config.jitoAuthPrivateKey));
@@ -125,6 +126,9 @@ class APEXBot {
         console.error('⚠️  Erreur initialisation Sniper:', error);
         console.log('⚠️  Le bot fonctionnera en mode analyse uniquement (pas de trades)');
       }
+    } else if (!config.tradingEnabled) {
+      console.log('⚠️  TRADING_ENABLED=false');
+      console.log('⚠️  Live trading désactivé par défaut, mode analyse uniquement');
     } else {
       console.log('⚠️  WALLET_PRIVATE_KEY ou JITO_AUTH_PRIVATE_KEY manquants');
       console.log('⚠️  Le bot fonctionnera en mode analyse uniquement (pas de trades)');
@@ -427,6 +431,7 @@ function loadConfig(): AppConfig {
   return {
     rpcUrl,
     wsUrl,
+    tradingEnabled: process.env.TRADING_ENABLED === 'true',
     walletPrivateKey: process.env.WALLET_PRIVATE_KEY || '',
     jitoAuthPrivateKey: process.env.JITO_AUTH_PRIVATE_KEY || '',
     jitoBlockEngineUrl: process.env.JITO_BLOCK_ENGINE_URL || 'https://mainnet.block-engine.jito.wtf',

@@ -4,10 +4,7 @@ import {
   PublicKey,
   VersionedTransaction,
   TransactionMessage,
-  AddressLookupTableAccount,
 } from '@solana/web3.js';
-import { searcherClient, SearcherClient } from 'jito-ts/src/sdk/block-engine/searcher.js';
-import { Bundle } from 'jito-ts/src/sdk/block-engine/types.js';
 import type { ScoredToken, ExecutionBundle } from '../types/index.js';
 import bs58 from 'bs58';
 
@@ -39,6 +36,10 @@ interface JupiterSwapResponse {
   lastValidBlockHeight: number;
 }
 
+interface JitoBundleClient {
+  sendBundle(bundle: unknown): Promise<string>;
+}
+
 export interface SniperConfig {
   rpcUrl: string;
   walletKeypair: Keypair;
@@ -52,8 +53,9 @@ export interface SniperConfig {
 export class Sniper {
   private connection: Connection;
   private wallet: Keypair;
-  private jitoClient: SearcherClient;
+  private jitoClient: JitoBundleClient | null = null;
   private jitoAuthKeypair: Keypair;
+  private jitoBlockEngineUrl: string;
   private jupiterApiUrl: string;
   private swapAmountSol: number;
   private slippageBps: number;
@@ -79,12 +81,7 @@ export class Sniper {
     
     this.wallet = config.walletKeypair;
     this.jitoAuthKeypair = config.jitoAuthKeypair;
-    
-    // Initialise Jito Searcher Client
-    this.jitoClient = searcherClient(
-      config.jitoBlockEngineUrl,
-      this.jitoAuthKeypair
-    );
+    this.jitoBlockEngineUrl = config.jitoBlockEngineUrl;
 
     this.jupiterApiUrl = config.jupiterApiUrl || 'https://quote-api.jup.ag/v6';
     this.swapAmountSol = config.swapAmountSol || 0.1;
@@ -147,6 +144,32 @@ export class Sniper {
       console.error(`[Sniper] ❌ Erreur après ${elapsed}ms:`, error);
       return null;
     }
+  }
+
+  /**
+   * Charge le client Jito à la demande pour éviter que ses types internes
+   * ne contaminent le typecheck du reste du repo.
+   */
+  private async getJitoClient(): Promise<JitoBundleClient> {
+    if (this.jitoClient) {
+      return this.jitoClient;
+    }
+
+    const { searcherClient } = await import('jito-ts/dist/sdk/block-engine/searcher.js');
+    this.jitoClient = searcherClient(
+      this.jitoBlockEngineUrl,
+      this.jitoAuthKeypair
+    ) as JitoBundleClient;
+
+    return this.jitoClient;
+  }
+
+  /**
+   * Construit un bundle Jito à l'exécution pour éviter les imports source `jito-ts/src/*`.
+   */
+  private async createJitoBundle(transactions: VersionedTransaction[]): Promise<unknown> {
+    const { Bundle } = await import('jito-ts/dist/sdk/block-engine/types.js');
+    return new Bundle(transactions, transactions.length);
   }
 
   /**
@@ -251,11 +274,11 @@ export class Sniper {
     const transferIx = SystemProgram.transfer({
       fromPubkey: this.wallet.publicKey,
       toPubkey: tipAccount,
-      lamports: BigInt(tipLamports),
+      lamports: tipLamports,
     });
 
     // Récupère le blockhash récent
-    const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash('confirmed');
+    const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
 
     // Crée le message de transaction
     const messageV0 = new TransactionMessage({
@@ -318,11 +341,11 @@ export class Sniper {
    */
   private async sendJitoBundle(bundle: ExecutionBundle): Promise<string | null> {
     try {
-      // Crée le bundle Jito (le constructeur prend directement VersionedTransaction[])
-      const jitoBundle = new Bundle(bundle.transactions, bundle.transactions.length);
+      const jitoClient = await this.getJitoClient();
+      const jitoBundle = await this.createJitoBundle(bundle.transactions);
 
       // Envoie au Block Engine
-      const bundleId = await this.jitoClient.sendBundle(jitoBundle);
+      const bundleId = await jitoClient.sendBundle(jitoBundle);
 
       console.log(`[Sniper] 📦 Bundle ID: ${bundleId}`);
 

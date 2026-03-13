@@ -1,0 +1,41 @@
+---
+description: ""
+globs: ["src/**/*.ts", "scripts/**/*.ts"]
+alwaysApply: false
+---
+
+# TypeScript — Standards APEX-2026
+
+## Types & Interfaces
+- Toujours importer depuis `@/types/index.ts` avant d'en créer de nouveaux.
+- Zéro `any`. Si inévitable → `unknown` + type guard explicite.
+- `interface` pour les shapes de données, `type` pour unions/intersections.
+
+## Async & Performance
+- Toujours `async/await`. Jamais `.then().catch()` chaîné.
+- Opérations parallèles → `Promise.all()` ou `Promise.any()` (RPC Racing).
+- Jamais de `await` dans une boucle `for` → utiliser `Promise.all(array.map(...))`.
+- Mesurer les fonctions critiques :
+  const t0 = performance.now()
+  const result = await criticalOperation()
+  console.log(`✅ criticalOperation: ${(performance.now() - t0).toFixed(2)}ms`)
+
+## Gestion d'Erreurs
+- Wrap obligatoire sur toutes les opérations réseau/RPC :
+  try { ... } catch (err) {
+    console.error(`❌ [ComponentName] ${err instanceof Error ? err.message : err}`)
+    return null
+  }
+- Ne JAMAIS throw dans un handler WebSocket ou setInterval.
+
+## Imports
+- Extensions `.js` obligatoires dans les imports relatifs TypeScript (ESM Bun).
+- Imports de types → `import type { ... }` pour le tree-shaking.
+
+## Bun natif (priorité absolue)
+- `Bun.redis` au lieu de ioredis
+- `Bun.sleep()` au lieu de `new Promise(r => setTimeout(r, ms))`
+- `Bun.file()` au lieu de fs.readFile/writeFile
+- `WebSocket` natif Bun au lieu du package `ws`
+- `bun:sqlite` au lieu de better-sqlite3
+

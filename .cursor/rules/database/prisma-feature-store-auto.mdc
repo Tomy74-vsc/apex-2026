@@ -1,0 +1,36 @@
+---
+description: ""
+globs: ["prisma/**/*.prisma", "src/database/**/*.ts", "src/store/**/*.ts"]
+alwaysApply: false
+---
+
+# Database & Feature Store — Règles APEX-2026
+
+## Singleton PrismaClient
+Une seule instance dans tout le projet, dans src/database/client.ts.
+Ne jamais instancier PrismaClient directement ailleurs.
+Toujours importer : import prisma from '../database/client.js'
+
+## Writes Non-Bloquants (Règle Absolue)
+Les writes DB ne bloquent JAMAIS le pipeline de trading :
+
+  // ✅ Fire-and-forget obligatoire
+  function logAsync(data: CreateInput): void {
+    prisma.tokenDetection.create({ data })
+      .catch(err => console.error(`❌ [DB] ${err.message}`))
+    // Pas d'await — le trading continue
+  }
+
+## Feature Store — Nommage
+- feat_  → features numériques pour ML training
+- label_ → outcomes/labels pour supervision
+- meta_  → métadonnées non utilisées en training
+
+## Point-in-Time Correctness
+Les features stockées reflètent EXACTEMENT l'état au moment de la décision.
+Jamais de données calculées après coup dans les champs feat_.
+
+## Export ML
+Dataset exportable CSV avec : bun scripts/export-ml-dataset.ts
+Format : pandas-compatible, booleans → 0/1, nulls → chaîne vide
+

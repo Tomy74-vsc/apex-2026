@@ -1,112 +1,77 @@
-# APEX-2026 - Bot Trading HFT Solana
+# APEX-2026
 
-Bot de trading haute fréquence (HFT) pour Solana, spécialisé dans la détection et l'analyse instantanée de nouveaux tokens sur Raydium AMM v4.
+Bot de trading Solana en Bun/TypeScript, orienté detection rapide, scoring, guard on-chain et execution Jupiter/Jito.
 
-## 🚀 Fonctionnalités
+## Etat actuel
 
-- ⚡ **Détection temps réel** : WebSocket sur Raydium (< 100ms)
-- 🛡️ **Analyse sécurité** : Guard avec vérification complète (autorités, liquidité, honeypot)
-- 🎯 **Scoring intelligent** : DecisionCore avec score 0-100
-- 🔥 **FastCheck** : Priorité absolue pour haute liquidité (> 100 SOL)
-- 💾 **Cache optimisé** : Évite les doublons (Map locale)
-- 📊 **Pipeline complet** : Scanner → Guard → Scoring → Sniper (TODO)
+- Runtime principal: Bun `1.3.10`
+- TypeScript cible: `5.9.3`
+- Le repo passe `bun run typecheck`
+- Le live trading est desactive par defaut
+- Toute execution live exige `TRADING_ENABLED=true`
 
-## 📦 Installation
+## Installation
 
 ```bash
 bun install
 ```
 
-## ⚙️ Configuration
+## Configuration
 
-Créez un fichier `.env` :
+Copiez `.env.example` vers `.env`, puis renseignez uniquement les secrets necessaires.
 
-```env
-HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
-HELIUS_WS_URL=wss://mainnet.helius-rpc.com/?api-key=YOUR_KEY
-```
+Variables importantes:
 
-## 🧪 Tests
+- `RPC_URL`
+- `HELIUS_GEYSER_ENDPOINT`
+- `HELIUS_API_KEY`
+- `WALLET_PRIVATE_KEY`
+- `JITO_BLOCK_ENGINE_URL`
+- `JITO_AUTH_PRIVATE_KEY`
+- `TRADING_ENABLED=false` par defaut
 
-```bash
-# Test Guard (analyse sécurité)
-bun scripts/test-guard.ts <MINT_ADDRESS>
-
-# Test MarketScanner (détection temps réel)
-bun scripts/test-market-scanner.ts
-
-# Test Pipeline complet
-bun scripts/test-decision-core.ts
-```
-
-## 📚 Documentation
-
-- [Guide de Démarrage Rapide](docs/QUICKSTART.md)
-- [Architecture Complète](docs/ARCHITECTURE.md)
-- [Guard README](src/detectors/README.md)
-- [MarketScanner README](src/ingestors/README.md)
-
-## Runtime et versions cibles
-
-- **Runtime principal** : Bun `1.3.10`
-- **TypeScript** : `5.9.3`
-- **Politique de versions** : pas de Bun 2.x, pas de TypeScript 6 RC sur la branche principale
-
-## Vérification rapide
+## Verification rapide
 
 ```bash
 bun --version
 bun install --frozen-lockfile
 bun run typecheck
+bun run verify
 ```
 
-## 🏗️ Architecture
+## Scripts utiles
 
-```
-MarketScanner (WebSocket) → DecisionCore → Guard → Sniper (TODO)
-     ↓                           ↓            ↓
-  newToken                   Scoring      Security
-  fastCheck                  0-100        Analysis
-```
+- `bun run start`
+- `bun run typecheck`
+- `bun run verify`
+- `bun scripts/test-guard.ts <MINT_ADDRESS>`
+- `bun scripts/test-market-scanner.ts`
+- `bun scripts/test-decision-core.ts`
 
-## 🎯 Roadmap
+## Documentation
 
-- [x] MarketScanner avec WebSocket onLogs
-- [x] Guard avec analyse complète
-- [x] DecisionCore avec scoring
-- [x] FastCheck pour haute liquidité
-- [ ] Sniper avec Jito + Jupiter
-- [ ] Social signals (X/Twitter)
-- [ ] Dashboard monitoring
+- [Quickstart](docs/QUICKSTART.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Guard](src/detectors/README.md)
+- [Ingestors](src/ingestors/README.md)
 
-## 🔧 Stack Technique
+## Notes de securite
 
-- **Runtime** : Bun `1.3.10`
-- **Langage** : TypeScript `5.9.3`
-- **Blockchain** : Solana (@solana/web3.js, @solana/spl-token)
-- **DEX** : Raydium AMM v4, Jupiter v6
-- **MEV** : Jito Block Engine (TODO)
+- Le repo n'active pas le live trading sans opt-in explicite.
+- `src/app.ts` ne doit instancier `Sniper` que si `TRADING_ENABLED=true`.
+- `src/executor/Sniper.ts` bloque aussi localement `executeSwap()` et `sendJitoBundle()` si `TRADING_ENABLED` n'est pas `true`.
 
-## État honnête de la migration
+## Compatibilite restante
 
-- Le repo reste basé sur Bun comme runtime principal.
-- Les versions critiques sont désormais destinées à être figées et reproductibles.
-- La migration de versions ne garantit pas à elle seule un typecheck vert.
-- Si certaines dépendances restent incompatibles avec Bun `1.3.10` ou TypeScript `5.9.3`, elles doivent être traitées séparément, sans bricolage métier.
-- Le live trading reste désactivé par défaut et nécessite `TRADING_ENABLED=true`.
+- `jito-ts@3.0.1` n'expose pas une API publique stable compatible avec la configuration TypeScript actuelle.
+- `src/executor/Sniper.ts` charge encore dynamiquement `jito-ts/dist/sdk/block-engine/searcher.js` et `jito-ts/dist/sdk/block-engine/types.js`.
+- Ce choix est volontaire et temporaire: c'est un `temporary compatibility shim` pour isoler Jito sans re-casser le typecheck global.
+- Cette integration reste plus fragile qu'un import public supporte par la dependance.
 
-## Incompatibilités restantes connues
+## Honnetete sur l'etat du repo
 
-- `jito-ts@3.0.1` reste incompatible avec le typecheck actuel sous `verbatimModuleSyntax` et TypeScript `5.9.3`.
-- Le code applicatif a encore des erreurs de typage dans `src/detectors/Guard.ts`.
-- `bs58` a une version majeure stable plus récente, mais elle n'a pas été adoptée dans cette migration afin de conserver une montée de version sûre et limitée.
+- La migration de versions a ete stabilisee sans refonte metier.
+- Le typecheck est vert, mais cela ne vaut pas validation end-to-end du chemin Jupiter/Jito en conditions reelles.
+- Les promesses de latence HFT du projet doivent etre relues a l'aune de l'implementation reelle et des dependances externes.
 
-## 📊 Performance
-
-- Latence détection : **< 100ms**
-- Pipeline complet : **2-5s** (standard), **1-3s** (FastCheck)
-- Throughput : **~50 tokens/minute**
-
----
-
-Créé avec [Bun](https://bun.com) 🚀
+Created with [Bun](https://bun.sh)

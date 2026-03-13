@@ -1,0 +1,34 @@
+---
+description: "Règles Paper Trading Engine, Feature Store ML, Backtesting. Utiliser pour src/paper-trading/, src/ml/, scripts/backtest*"
+globs: ["src/paper-trading/**/*.ts", "src/ml/**/*.ts", "scripts/backtest*.ts"]
+alwaysApply: false
+---
+
+# Paper Trading & ML — Règles APEX-2026
+
+## Philosophie : Data Factory
+Chaque décision (achat OU rejet) = donnée d'entraînement. Rien n'est jeté.
+Le Paper Trading est un Feature Store, pas un simulateur de P&L.
+
+## Labels Obligatoires — 3 horizons
+- T+5min  → label_roi_5min_pct  + label_is_winner_5min  (seuil : +20%)
+- T+15min → label_roi_15min_pct + label_is_winner_15min (seuil : +50%)
+- T+60min → label_roi_60min_pct + label_is_winner_60min (seuil : +100%)
+
+## Backtesting — Pattern ClockProvider
+  interface ClockProvider { now(): number }
+  class LiveClock implements ClockProvider { now = () => Date.now() }
+  class BacktestClock implements ClockProvider { constructor(public ts: number) {} now = () => this.ts }
+
+Le DecisionCore ne doit JAMAIS appeler Date.now() directement.
+Toujours injecter ClockProvider pour permettre le backtesting.
+
+## Formules Quant Obligatoires
+Kelly Criterion : f* = (p*b - q) / b  (p=win_rate, q=1-p, b=avg_win/avg_loss)
+Time-Decay : score_t = score_0 * e^(-0.05 * age_seconds)
+Vélocité : V = mentions_30s / baseline_30s * decay_factor
+
+## Export Format Python
+CSV header : mint, detected_at_ts, feat_*, label_*
+Types : booleans → 0/1, BigInt → string, nulls → chaîne vide
+

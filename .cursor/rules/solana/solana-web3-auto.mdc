@@ -1,0 +1,47 @@
+---
+description: ""
+globs: ["src/ingestors/**/*.ts", "src/detectors/**/*.ts", "src/executor/**/*.ts"]
+alwaysApply: false
+---
+
+# Solana & Web3 — Règles APEX-2026
+
+## RPC Racing (Pattern Obligatoire)
+Ne JAMAIS dépendre d'un seul RPC. Pattern systématique :
+
+  const RPC_URLS = [
+    process.env.HELIUS_RPC_URL!,
+    process.env.QUICKNODE_RPC_URL ?? 'https://api.mainnet-beta.solana.com',
+  ].filter(Boolean)
+
+  async function rpcRace<T>(fn: (url: string) => Promise<T>): Promise<T> {
+    return Promise.any(RPC_URLS.map(url => fn(url)))
+  }
+
+## WebSocket Auto-Reconnect (Obligatoire)
+Tout scanner WebSocket DOIT implémenter :
+  private reconnectDelay = 1000
+  private readonly MAX_RECONNECT_DELAY = 30_000
+
+  private async handleReconnect(): Promise<void> {
+    console.warn(`⚠️ WebSocket déconnecté. Retry dans ${this.reconnectDelay}ms`)
+    await Bun.sleep(this.reconnectDelay)
+    this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.MAX_RECONNECT_DELAY)
+    try { await this.start() } catch { /* retry loop */ }
+  }
+
+## Commitment Levels
+- Détection (onLogs) → 'processed' (latence minimale)
+- Validation (Guard) → 'confirmed' (fiabilité)
+- Post-trade → 'finalized' (certitude)
+
+## Jupiter v6 REST
+- Endpoint : https://quote-api.jup.ag/v6
+- Timeout hard 5s sur chaque call via AbortController
+- slippageBps toujours depuis process.env.SLIPPAGE_BPS
+
+## Jito Tips Dynamiques
+- HIGH priority → 5_000_000 lamports (0.005 SOL) en paper, 50_000_000 en live
+- MEDIUM → 2_000_000 lamports paper, 10_000_000 live
+- LOW → 1_000_000 lamports paper, 1_000_000 live
+

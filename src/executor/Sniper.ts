@@ -4,25 +4,38 @@ import {
   PublicKey,
   TransactionMessage,
   VersionedTransaction,
+  ComputeBudgetProgram,
 } from '@solana/web3.js';
 import bs58 from 'bs58';
 import type { ExecutionBundle, ScoredToken } from '../types/index.js';
 
-interface JupiterQuoteResponse {
+interface UltraOrderRequest {
   inputMint: string;
   outputMint: string;
-  inAmount: string;
-  outAmount: string;
-  otherAmountThreshold: string;
-  swapMode: string;
-  slippageBps: number;
-  priceImpactPct: number;
-  routePlan: unknown[];
+  amount: string; // lamports en string
+  taker: string; // wallet public key
+  slippageBps?: number;
 }
 
-interface JupiterSwapResponse {
-  swapTransaction: string;
-  lastValidBlockHeight: number;
+interface UltraOrderResponse {
+  transaction: string; // base64 — transaction non signée pré-construite
+  requestId: string; // lier order → execute
+  inputAmount: string;
+  outputAmount: string;
+  priceImpactPct: number;
+  routePlan?: unknown[];
+}
+
+interface UltraExecuteRequest {
+  signedTransaction: string; // base64 — transaction signée par le wallet
+  requestId: string; // doit correspondre à l'order
+}
+
+interface UltraExecuteResponse {
+  signature: string; // tx signature on-chain
+  status: 'Success' | 'Failed';
+  error?: string;
+  slot?: number;
 }
 
 interface JitoBundleClient {
@@ -30,6 +43,7 @@ interface JitoBundleClient {
 }
 
 const TRADING_ENABLED_ENV = 'TRADING_ENABLED';
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
 export interface SniperConfig {
   rpcUrl: string;
@@ -39,6 +53,7 @@ export interface SniperConfig {
   jupiterApiUrl?: string;
   swapAmountSol?: number;
   slippageBps?: number;
+  ultraApiUrl?: string;
 }
 
 export class Sniper {
@@ -47,13 +62,11 @@ export class Sniper {
   private jitoClient: JitoBundleClient | null = null;
   private jitoAuthKeypair: Keypair;
   private jitoBlockEngineUrl: string;
-  private jupiterApiUrl: string;
+  private ultraApiUrl: string;
   private swapAmountSol: number;
   private slippageBps: number;
 
-  private readonly TIP_HIGH = 50_000_000;
-  private readonly TIP_MEDIUM = 10_000_000;
-  private readonly TIP_LOW = 1_000_000;
+  private readonly CU_LIMIT_SWAP = 140_000;
 
   private readonly JITO_TIP_ACCOUNTS = [
     'Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY',
@@ -71,13 +84,20 @@ export class Sniper {
     this.wallet = config.walletKeypair;
     this.jitoAuthKeypair = config.jitoAuthKeypair;
     this.jitoBlockEngineUrl = config.jitoBlockEngineUrl;
-    this.jupiterApiUrl = config.jupiterApiUrl || 'https://quote-api.jup.ag/v6';
+    this.ultraApiUrl =
+      process.env['JUPITER_ULTRA_URL'] ??
+      config.ultraApiUrl ??
+      config.jupiterApiUrl ??
+      'https://lite-api.jup.ag/ultra/v1';
     this.swapAmountSol = config.swapAmountSol || 0.1;
     this.slippageBps = config.slippageBps || 300;
   }
 
   async executeSwap(scoredToken: ScoredToken): Promise<string | null> {
-    const startTime = Date.now();
+    const t0 = performance.now();
+    console.log(
+      `[Sniper] 🎯 ${scoredToken.token.symbol} (${scoredToken.priority}) | score=${scoredToken.finalScore}`,
+    );
 
     try {
       if (!this.isTradingEnabled()) {
@@ -85,42 +105,76 @@ export class Sniper {
         return null;
       }
 
-      console.log(`[Sniper] Executing swap for ${scoredToken.token.symbol} (${scoredToken.priority})`);
+      // Étape 1 : Ultra Order
+      const tOrder = performance.now();
+      const order = await this.callUltraOrder(scoredToken.token.mint);
+      if (!order) {
+        return null;
+      }
+      const orderMs = (performance.now() - tOrder).toFixed(0);
 
-      const quote = await this.getJupiterQuote(scoredToken.token.mint);
-      if (!quote) {
-        console.error('[Sniper] Unable to fetch Jupiter quote');
+      if ((order.priceImpactPct ?? 0) > 10) {
+        console.warn(
+          `[Sniper] ⚠️ Price impact trop élevé: ${order.priceImpactPct.toFixed(2)}%`,
+        );
         return null;
       }
 
-      console.log(`[Sniper] Quote: ${quote.inAmount} SOL -> ${quote.outAmount} ${scoredToken.token.symbol}`);
-      console.log(`[Sniper] Price impact: ${quote.priceImpactPct.toFixed(2)}%`);
-
-      if (quote.priceImpactPct > 10) {
-        console.warn(`[Sniper] Price impact too high (${quote.priceImpactPct.toFixed(2)}%), aborting`);
-        return null;
+      // Étape 2 : Shield check
+      const shield = await this.checkJupiterShield(scoredToken.token.mint);
+      if (!shield.safe) {
+        console.warn(`[Sniper] 🛡️ Shield: ${shield.warnings.join(' | ')}`);
+        if (scoredToken.priority !== 'HIGH') {
+          console.warn('[Sniper] ⚠️ Annulation — non-HIGH + Shield warning');
+          return null;
+        }
       }
 
-      const swapTx = await this.createSwapTransaction(quote);
-      if (!swapTx) {
-        console.error('[Sniper] Unable to create swap transaction');
-        return null;
-      }
+      // Étape 3 : Désérialise + signe la tx
+      const tSign = performance.now();
+      const txBuffer = Buffer.from(order.transaction, 'base64');
+      const tx = VersionedTransaction.deserialize(txBuffer);
+      this.addComputeBudget(tx, scoredToken.priority);
+      tx.sign([this.wallet]);
+      const signMs = (performance.now() - tSign).toFixed(0);
 
-      const jitoTip = this.calculateJitoTip(scoredToken.priority);
+      // Étape 4 : Tip Jito
+      const slotAge = await this.getSlotAge();
+      const jitoTip = this.estimateTip(scoredToken.priority, slotAge);
       const tipTx = await this.createJitoTipTransaction(jitoTip);
-      const bundle = this.createExecutionBundle([swapTx, tipTx], jitoTip, scoredToken.token.mint);
 
-      console.log(`[Sniper] Jito tip: ${(jitoTip / 1e9).toFixed(4)} SOL`);
+      // Étape 5 : Bundle Jito
+      const bundle = this.createExecutionBundle(
+        [tx, tipTx],
+        jitoTip,
+        scoredToken.token.mint,
+      );
+      const bundleSig = await this.sendJitoBundle(bundle);
 
-      const signature = await this.sendJitoBundle(bundle);
-      const elapsed = Date.now() - startTime;
-      console.log(`[Sniper] Bundle submitted in ${elapsed}ms - Signature: ${signature}`);
+      if (!bundleSig) {
+        console.warn('[Sniper] ⚠️ Jito bundle échoué — fallback Ultra execute');
+        const tExec = performance.now();
+        const signature = await this.callUltraExecute(tx, order.requestId);
+        const execMs = (performance.now() - tExec).toFixed(0);
+        const totalMs = (performance.now() - t0).toFixed(0);
+        console.log(
+          `[Sniper] 📊 order=${orderMs}ms | sign=${signMs}ms | exec=${execMs}ms | TOTAL=${totalMs}ms | tip=${(
+            jitoTip / 1e9
+          ).toFixed(4)} SOL`,
+        );
+        return signature;
+      }
 
-      return signature;
+      const totalMs = (performance.now() - t0).toFixed(0);
+      console.log(
+        `[Sniper] 📊 order=${orderMs}ms | sign=${signMs}ms | jito=bundle | TOTAL=${totalMs}ms | tip=${(
+          jitoTip / 1e9
+        ).toFixed(4)} SOL`,
+      );
+      return bundleSig;
     } catch (error) {
-      const elapsed = Date.now() - startTime;
-      console.error(`[Sniper] Error after ${elapsed}ms:`, error);
+      const elapsed = (performance.now() - t0).toFixed(0);
+      console.error(`[Sniper] ❌ Erreur après ${elapsed}ms:`, error);
       return null;
     }
   }
@@ -158,61 +212,90 @@ export class Sniper {
     return process.env[TRADING_ENABLED_ENV] === 'true';
   }
 
-  private async getJupiterQuote(outputMint: string): Promise<JupiterQuoteResponse | null> {
+  private async callUltraOrder(outputMint: string): Promise<UltraOrderResponse | null> {
+    const t0 = performance.now();
     try {
-      const inputMint = 'So11111111111111111111111111111111111111112';
-      const amountLamports = Math.floor(this.swapAmountSol * 1e9);
-
-      const url = `${this.jupiterApiUrl}/quote?` + new URLSearchParams({
-        inputMint,
+      const body: UltraOrderRequest = {
+        inputMint: SOL_MINT,
         outputMint,
-        amount: amountLamports.toString(),
-        slippageBps: this.slippageBps.toString(),
-        onlyDirectRoutes: 'false',
-        asLegacyTransaction: 'false',
+        amount: Math.floor(this.swapAmountSol * 1e9).toString(),
+        taker: this.wallet.publicKey.toBase58(),
+        slippageBps: this.slippageBps,
+      };
+
+      const resp = await fetch(`${this.ultraApiUrl}/order`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(5_000),
       });
 
-      const response = await fetch(url);
-      if (!response.ok) {
-        console.error(`[Sniper] Jupiter quote API error: ${response.status} ${response.statusText}`);
+      if (!resp.ok) {
+        console.error(
+          `[Sniper] ❌ Ultra /order ${resp.status}: ${await resp.text()}`,
+        );
         return null;
       }
 
-      return (await response.json()) as JupiterQuoteResponse;
-    } catch (error) {
-      console.error('[Sniper] getJupiterQuote error:', error);
+      const data = (await resp.json()) as UltraOrderResponse;
+      console.log(
+        `[Sniper] 📋 Ultra order en ${(performance.now() - t0).toFixed(0)}ms` +
+          ` | impact=${data.priceImpactPct?.toFixed(2) ?? '?'}%` +
+          ` | out=${data.outputAmount}`,
+      );
+      return data;
+    } catch (err) {
+      console.error('[Sniper] ❌ callUltraOrder:', err);
       return null;
     }
   }
 
-  private async createSwapTransaction(
-    quote: JupiterQuoteResponse
-  ): Promise<VersionedTransaction | null> {
+  private async callUltraExecute(
+    signedTx: VersionedTransaction,
+    requestId: string,
+  ): Promise<string | null> {
+    const t0 = performance.now();
     try {
-      const response = await fetch(`${this.jupiterApiUrl}/swap`, {
+      const serialized = Buffer.from(signedTx.serialize()).toString('base64');
+
+      const body: UltraExecuteRequest = {
+        signedTransaction: serialized,
+        requestId,
+      };
+
+      const resp = await fetch(`${this.ultraApiUrl}/execute`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          quoteResponse: quote,
-          userPublicKey: this.wallet.publicKey.toBase58(),
-          wrapAndUnwrapSol: true,
-          dynamicComputeUnitLimit: true,
-          prioritizationFeeLamports: 'auto',
-        }),
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(10_000),
       });
 
-      if (!response.ok) {
-        console.error(`[Sniper] Jupiter swap API error: ${response.status}`);
+      if (!resp.ok) {
+        console.error(
+          `[Sniper] ❌ Ultra /execute ${resp.status}: ${await resp.text()}`,
+        );
         return null;
       }
 
-      const swapResponse = (await response.json()) as JupiterSwapResponse;
-      const txBuffer = Buffer.from(swapResponse.swapTransaction, 'base64');
-      const tx = VersionedTransaction.deserialize(txBuffer);
-      tx.sign([this.wallet]);
-      return tx;
-    } catch (error) {
-      console.error('[Sniper] createSwapTransaction error:', error);
+      const data = (await resp.json()) as UltraExecuteResponse;
+      const elapsed = (performance.now() - t0).toFixed(0);
+
+      if (data.status !== 'Success') {
+        console.error(
+          `[Sniper] ❌ Ultra execute status=${data.status} | ${data.error}`,
+        );
+        return null;
+      }
+
+      console.log(
+        `[Sniper] ✅ Ultra execute en ${elapsed}ms | sig=${data.signature?.slice(
+          0,
+          12,
+        )}…`,
+      );
+      return data.signature;
+    } catch (err) {
+      console.error('[Sniper] ❌ callUltraExecute:', err);
       return null;
     }
   }
@@ -246,15 +329,119 @@ export class Sniper {
     return tx;
   }
 
-  private calculateJitoTip(priority: 'HIGH' | 'MEDIUM' | 'LOW'): number {
-    switch (priority) {
-      case 'HIGH':
-        return this.TIP_HIGH;
-      case 'MEDIUM':
-        return this.TIP_MEDIUM;
-      case 'LOW':
-      default:
-        return this.TIP_LOW;
+  private computeCUPrice(priority: 'HIGH' | 'MEDIUM' | 'LOW'): number {
+    const targets: Record<'HIGH' | 'MEDIUM' | 'LOW', number> = {
+      HIGH: 2_000_000,
+      MEDIUM: 500_000,
+      LOW: 100_000,
+    };
+    return Math.ceil((targets[priority] * 1_000_000) / this.CU_LIMIT_SWAP);
+  }
+
+  private addComputeBudget(
+    tx: VersionedTransaction,
+    priority: 'HIGH' | 'MEDIUM' | 'LOW',
+  ): void {
+    try {
+      const cbProgramId = ComputeBudgetProgram.programId.toBase58();
+      const hasCB = tx.message.staticAccountKeys.some(
+        (k) => k.toBase58() === cbProgramId,
+      );
+
+      if (hasCB) {
+        console.log('[Sniper] 💻 CB: déjà présent (Jupiter), skip injection');
+        return;
+      }
+
+      const decompiledMsg = TransactionMessage.decompile(tx.message);
+
+      const cuLimitIx = ComputeBudgetProgram.setComputeUnitLimit({
+        units: this.CU_LIMIT_SWAP,
+      });
+      const cuPriceIx = ComputeBudgetProgram.setComputeUnitPrice({
+        microLamports: this.computeCUPrice(priority),
+      });
+
+      decompiledMsg.instructions = [cuLimitIx, cuPriceIx, ...decompiledMsg.instructions];
+
+      const recompiledMsg = decompiledMsg.compileToV0Message();
+
+      tx.message = recompiledMsg;
+
+      const price = this.computeCUPrice(priority);
+      const approxPriorityFeeSol =
+        (this.CU_LIMIT_SWAP * price) / 1_000_000 / 1e9;
+
+      console.log(
+        `[Sniper] 💻 CB injecté: limit=${this.CU_LIMIT_SWAP} | price=${price} µL` +
+          ` | priority_fee≈${approxPriorityFeeSol.toFixed(5)} SOL`,
+      );
+    } catch (err) {
+      console.warn('[Sniper] ⚠️ addComputeBudget failed (tx part sans CB):', err);
+    }
+  }
+
+  private estimateTip(
+    priority: 'HIGH' | 'MEDIUM' | 'LOW',
+    slotAge: number = 0,
+  ): number {
+    const base: Record<'HIGH' | 'MEDIUM' | 'LOW', number> = {
+      HIGH: 50_000_000,
+      MEDIUM: 10_000_000,
+      LOW: 1_000_000,
+    };
+
+    const multiplier = slotAge > 8 ? 1.8 : slotAge > 3 ? 1.3 : 1.0;
+    const tip = Math.floor(base[priority] * multiplier);
+
+    if (multiplier > 1.0) {
+      console.log(
+        `[Sniper] ⚡ Congestion détectée (slotAge=${slotAge})` +
+          ` | tip multiplier=${multiplier}×` +
+          ` | tip=${(tip / 1e9).toFixed(4)} SOL`,
+      );
+    }
+
+    return tip;
+  }
+
+  private cachedSlotAge = 0;
+  private lastSlotCheck = 0;
+
+  private async getSlotAge(): Promise<number> {
+    const now = Date.now();
+    if (now - this.lastSlotCheck > 2_000) {
+      this.lastSlotCheck = now;
+      this.connection
+        .getSlot('confirmed')
+        .then(() => {
+          this.cachedSlotAge = Math.floor((Date.now() - this.lastSlotCheck) / 400);
+        })
+        .catch(() => {});
+    }
+    return this.cachedSlotAge;
+  }
+
+  private async checkJupiterShield(
+    mint: string,
+  ): Promise<{
+    safe: boolean;
+    warnings: string[];
+  }> {
+    try {
+      const resp = await fetch(`${this.ultraApiUrl}/shield?mints=${mint}`, {
+        signal: AbortSignal.timeout(3_000),
+      });
+      if (!resp.ok) return { safe: true, warnings: [] };
+
+      const data = (await resp.json()) as {
+        warnings?: Array<{ message: string; severity: string }>;
+      };
+
+      const warnings = (data.warnings ?? []).map((w) => w.message);
+      return { safe: warnings.length === 0, warnings };
+    } catch {
+      return { safe: true, warnings: [] };
     }
   }
 
@@ -352,9 +539,7 @@ export class Sniper {
     return {
       swapAmountSol: this.swapAmountSol,
       slippageBps: this.slippageBps,
-      tipHigh: this.TIP_HIGH / 1e9,
-      tipMedium: this.TIP_MEDIUM / 1e9,
-      tipLow: this.TIP_LOW / 1e9,
+      ultraApiUrl: this.ultraApiUrl,
       tradingEnabled: this.isTradingEnabled(),
     };
   }

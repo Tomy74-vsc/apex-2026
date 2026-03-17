@@ -34,6 +34,8 @@ const TEST_SCORED_TOKEN: ScoredToken = {
   initialLiquiditySol: 150,
   initialPriceUsdc: 0.000012,
   timestamp: Date.now(),
+  t_source: Date.now(),
+  t_recv: Date.now(),
   social: {
     mint: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
     ticker: 'BONK',
@@ -124,9 +126,7 @@ async function testSniperConfig() {
     console.log('✅ Configuration chargée:');
     console.log(`   Swap Amount: ${config.swapAmountSol} SOL`);
     console.log(`   Slippage: ${config.slippageBps / 100}%`);
-    console.log(`   Tip HIGH: ${config.tipHigh} SOL`);
-    console.log(`   Tip MEDIUM: ${config.tipMedium} SOL`);
-    console.log(`   Tip LOW: ${config.tipLow} SOL`);
+    console.log(`   Tip policy: dynamique (heuristique slotAge)`);
   } catch (error) {
     console.error('❌ Erreur:', error);
   }

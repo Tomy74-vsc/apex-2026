@@ -1,0 +1,28 @@
+# APEX-2026 — Python ML/RL Dependencies
+# Runtime: Python 3.10+
+
+# Core ML
+torch>=2.2.0
+numpy>=1.26.0
+pandas>=2.1.0
+scikit-learn>=1.4.0
+
+# RL
+gymnasium>=0.29.0
+
+# ONNX export
+onnx>=1.15.0
+onnxruntime>=1.17.0
+
+# HMM
+hmmlearn>=0.3.0
+
+# Hawkes
+tick>=0.7.0
+
+# Data
+sqlite-utils>=3.36
+
+# Monitoring
+tensorboard>=2.15.0
+tqdm>=4.66.0

@@ -1,7 +1,12 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import type { VersionedTransactionResponse } from '@solana/web3.js';
 import { EventEmitter } from 'events';
-import { getMint } from '@solana/spl-token';
+import {
+  getMint,
+  TokenAccountNotFoundError,
+  TokenInvalidAccountOwnerError,
+  TokenInvalidAccountSizeError,
+} from '@solana/spl-token';
 import type { MarketEvent, TokenMetadata } from '../types/index.js';
 import type { ClientReadableStream } from '@grpc/grpc-js';
 
@@ -10,6 +15,19 @@ const RAYDIUM_AMM_V4_PROGRAM_ID = new PublicKey('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM
 
 // SOL mint address
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
+
+// Adresses système Solana à ignorer — ce ne sont pas des tokens SPL
+const SYSTEM_ADDRESSES = new Set([
+  '11111111111111111111111111111111', // System Program
+  'ComputeBudget111111111111111111111111111111', // Compute Budget
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', // Token Program
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe8bv', // Associated Token
+  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', // Jupiter
+  'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s', // Metaplex
+  SOL_MINT, // Wrapped SOL
+  RAYDIUM_AMM_V4_PROGRAM_ID.toBase58(), // Raydium AMM
+  'srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJejB', // Serum DEX
+]);
 
 // Instruction discriminator pour initialize2 (Raydium AMM v4)
 const INITIALIZE2_DISCRIMINATOR = Buffer.from([0xaf, 0xaf, 0x6d, 0x1f, 0x0d, 0x98, 0x9b, 0xed]);
@@ -565,8 +583,23 @@ export class MarketScanner extends EventEmitter {
         isBaseMintToken = true;
       }
 
+      // Filtre les mints système connus (Program IDs, wrapped SOL, etc.)
+      const mintBase58 = tokenMint.toBase58();
+      if (SYSTEM_ADDRESSES.has(mintBase58)) {
+        return null;
+      }
+
+      // Validation longueur base58 minimale pour un mint SPL
+      if (mintBase58.length < 32 || mintBase58.length > 44) {
+        return null;
+      }
+
       // Récupère les métadonnées du token
       const tokenMetadata = await this.getTokenMetadata(tokenMint);
+      if (tokenMetadata === null) {
+        // Token-2022 ou mint invalide → on rejette silencieusement le pool
+        return null;
+      }
 
       // Calcule la liquidité initiale en SOL
       const liquiditySol = await this.calculateInitialLiquidity(
@@ -579,7 +612,7 @@ export class MarketScanner extends EventEmitter {
       const priceUsdc = this.estimateInitialPrice(liquiditySol, meta);
 
       return {
-        mint: tokenMint.toBase58(),
+        mint: mintBase58,
         poolId,
         liquiditySol,
         priceUsdc,
@@ -594,7 +627,7 @@ export class MarketScanner extends EventEmitter {
   /**
    * Récupère les métadonnées d'un token
    */
-  private async getTokenMetadata(mint: PublicKey): Promise<TokenMetadata> {
+  private async getTokenMetadata(mint: PublicKey): Promise<TokenMetadata | null> {
     try {
       const mintInfo = await getMint(this.connection, mint);
 
@@ -607,13 +640,22 @@ export class MarketScanner extends EventEmitter {
         decimals: mintInfo.decimals,
       };
     } catch (error) {
-      console.error('❌ Erreur lors de la récupération des métadonnées:', error);
-      return {
-        mint: mint.toBase58(),
-        symbol: 'UNKNOWN',
-        name: 'Unknown Token',
-        decimals: 9, // Défaut pour Solana
-      };
+      // Token-2022, non-SPL ou toute autre erreur (réseau, RPC, etc.)
+      // → on rejette silencieusement ce mint pour ne jamais le faire entrer dans le pipeline.
+      if (
+        error instanceof TokenInvalidAccountSizeError ||
+        error instanceof TokenInvalidAccountOwnerError ||
+        error instanceof TokenAccountNotFoundError
+      ) {
+        return null;
+      }
+      const msg = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `⚠️ [MarketScanner] Métadonnées invalides pour ${mint
+          .toBase58()
+          .slice(0, 8)}: ${msg}`,
+      );
+      return null;
     }
   }
 

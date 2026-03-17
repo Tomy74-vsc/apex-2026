@@ -2,12 +2,18 @@ import { EventEmitter } from 'events';
 import { MarketScanner } from '../ingestors/MarketScanner.js';
 import { Guard } from '../detectors/Guard.js';
 import { SocialPulse } from '../ingestors/SocialPulse.js';
+import { getFeatureStore } from '../data/FeatureStore.js';
+import { getOutcomeTracker } from './OutcomeTracker.js';
+import { getAIBrain, type AIDecision } from './AIBrain.js';
+import { getFeatureAssembler } from '../features/FeatureAssembler.js';
+import { getShadowAgent } from './ShadowAgent.js';
 import type {
   MarketEvent,
   SecurityReport,
   ScoredToken,
   SocialSignal,
   DecisionLatency,
+  FeatureSnapshotRecord,
 } from '../types/index.js';
 
 /**
@@ -132,22 +138,29 @@ export class DecisionCore extends EventEmitter {
   }
 
   /**
-   * Traite un token détecté
-   * 
-   * @param event - Événement MarketEvent du scanner
-   * @param isFastCheck - True si c'est un FastCheck (priorité absolue)
+   * Traite un token detecte
+   *
+   * Pipeline V3 : Guard → FeatureAssembler → AIBrain.decide() → emit
    */
   private async processToken(event: MarketEvent, isFastCheck: boolean): Promise<void> {
     this.tokensProcessed++;
 
-    // Fallbacks backward compatible
     const t_source = event.t_source ?? event.timestamp ?? Date.now();
     const t_recv = event.t_recv ?? Date.now();
 
     try {
       const { token, initialLiquiditySol } = event;
 
-      // Filtre 1 : Liquidité minimale
+      const SYSTEM_MINTS = new Set([
+        '11111111111111111111111111111111',
+        'ComputeBudget111111111111111111111111111111',
+        'So11111111111111111111111111111111111111112',
+      ]);
+
+      if (SYSTEM_MINTS.has(token.mint)) {
+        return;
+      }
+
       if (initialLiquiditySol < this.minLiquidity) {
         this.rejectToken(
           token.mint,
@@ -156,13 +169,12 @@ export class DecisionCore extends EventEmitter {
         return;
       }
 
-      // Guard — mesure avec performance.now()
+      // ─── Guard ────────────────────────────────────────────────────────
       console.log(`🔍 Analyse sécurité: ${token.mint}${isFastCheck ? ' [FAST]' : ''}`);
       const guardStart = performance.now();
       const security: SecurityReport = await this.guard.validateToken(token.mint);
       const guardMs = Math.round(performance.now() - guardStart);
 
-      // Filtre 2 : Score de risque
       if (security.riskScore > this.maxRiskScore) {
         this.rejectToken(
           token.mint,
@@ -171,27 +183,46 @@ export class DecisionCore extends EventEmitter {
         return;
       }
 
-      // Filtre 3 : Token doit être safe
       if (!security.isSafe) {
         this.rejectToken(token.mint, `Token non sûr: ${security.flags.join(', ')}`);
         return;
       }
 
-      // Récupère les signaux sociaux (si SocialPulse disponible)
+      // ─── Social Signal ────────────────────────────────────────────────
       const socialSignal = this.socialPulse
         ? await this.socialPulse.getSignal(token.mint)
         : null;
 
-      // Score — mesure avec performance.now()
-      const scoreStart = performance.now();
-      const finalScore = this.calculateFinalScore(event, security, socialSignal, isFastCheck);
-      const scoringMs = Math.round((performance.now() - scoreStart) * 100) / 100; // 2 décimales
+      // ─── Feature Assembly (V3) ────────────────────────────────────────
+      const assembler = getFeatureAssembler();
+      const features = assembler.assemble(
+        token.mint,
+        initialLiquiditySol,
+        event.initialPriceUsdc,
+        socialSignal?.sentiment ?? 0,
+      );
 
-      // t_act : timestamp absolu de la décision
+      // ─── AIBrain Decision (replaces linear scoring) ───────────────────
+      const scoreStart = performance.now();
+      const securityScore = Math.max(0, 100 - security.riskScore);
+      const linearScore = this.calculateFinalScore(event, security, socialSignal, isFastCheck);
+
+      const brain = getAIBrain();
+      const aiDecision: AIDecision = brain.decide(
+        token.mint,
+        features,
+        securityScore,
+        isFastCheck,
+        linearScore,
+      );
+      const scoringMs = Math.round((performance.now() - scoreStart) * 100) / 100;
+
+      // Use AI score as the authoritative score
+      const finalScore = aiDecision.aiScore;
+
       const t_act = Date.now();
       const totalMs = t_act - t_source;
 
-      // Latences complètes
       const latency: DecisionLatency = {
         detectionMs: Math.max(0, t_recv - t_source),
         guardMs,
@@ -199,15 +230,14 @@ export class DecisionCore extends EventEmitter {
         totalMs: Math.max(0, totalMs),
       };
 
-      // Log structuré Blueprint V2
       console.log(
-        `⏱️  [${token.mint.slice(0, 8)}] detect=${latency.detectionMs}ms | guard=${latency.guardMs}ms | score=${latency.scoringMs}ms | TOTAL=${latency.totalMs}ms`,
+        `⏱️  [${token.mint.slice(0, 8)}] detect=${latency.detectionMs}ms | guard=${latency.guardMs}ms | ` +
+          `ai=${aiDecision.breakdown.totalMs.toFixed(1)}ms | TOTAL=${latency.totalMs}ms`,
       );
 
-      // Détermine la priorité
-      const priority = this.determinePriority(finalScore, initialLiquiditySol, isFastCheck);
+      // Priority from AIBrain confidence + regime
+      const priority = this.determinePriorityV3(aiDecision, initialLiquiditySol, isFastCheck);
 
-      // Crée le ScoredToken
       const scoredToken: ScoredToken = {
         ...event,
         t_act,
@@ -215,21 +245,53 @@ export class DecisionCore extends EventEmitter {
         security,
         finalScore,
         priority,
-        latency, // nouveau champ optionnel
+        latency,
+        aiDecision: {
+          action: aiDecision.action,
+          aiScore: aiDecision.aiScore,
+          confidence: aiDecision.confidence,
+          regime: aiDecision.regime,
+          kellyFraction: aiDecision.kelly.kellyFraction,
+          positionSol: aiDecision.kelly.positionSol,
+          latencyMs: aiDecision.latencyMs,
+        },
       };
 
-      // Émet l'événement
       this.emit('tokenScored', scoredToken);
 
-      // Si score suffisant, prêt pour snipe
-      if (finalScore >= 70 || (isFastCheck && finalScore >= 60)) {
+      // V3 Feature Logger — real assembled features (cold path)
+      try {
+        const snap = assembler.toSnapshot(
+          features,
+          isFastCheck ? 'pump' : 'websocket',
+        );
+        snap.latencyMs = latency.totalMs;
+        getFeatureStore().appendFeatureSnapshot(snap);
+        getOutcomeTracker().track(snap.id, token.mint, event.initialPriceUsdc);
+      } catch {
+        // cold path silencieux
+      }
+
+      // Shadow Agent — RL comparison (cold path, fire-and-forget)
+      try {
+        getShadowAgent().evaluate(token.mint, features, aiDecision);
+      } catch {
+        // cold path silencieux
+      }
+
+      // AIBrain decides snipe eligibility
+      if (aiDecision.action === 'BUY') {
         this.tokensAccepted++;
         console.log(
-          `✅ Token accepté: ${token.mint} (score: ${finalScore}, priorité: ${priority})`,
+          `✅ Token accepté: ${token.mint} | AI=${finalScore} | linear=${linearScore} | ` +
+            `regime=${aiDecision.regime} | kelly=${(aiDecision.kelly.kellyFraction * 100).toFixed(1)}% | priority=${priority}`,
         );
         this.emit('readyToSnipe', scoredToken);
       } else {
-        this.rejectToken(token.mint, `Score insuffisant: ${finalScore}`);
+        this.rejectToken(
+          token.mint,
+          `AIBrain SKIP: score=${finalScore} conf=${aiDecision.confidence.toFixed(2)} regime=${aiDecision.regime}`,
+        );
       }
     } catch (error) {
       console.error('❌ Erreur lors du traitement du token:', error);
@@ -299,25 +361,42 @@ export class DecisionCore extends EventEmitter {
   }
 
   /**
-   * Détermine la priorité d'un token
+   * V3 priority using AIBrain decision context.
+   */
+  private determinePriorityV3(
+    decision: AIDecision,
+    liquiditySol: number,
+    isFastCheck: boolean,
+  ): 'HIGH' | 'MEDIUM' | 'LOW' {
+    if (decision.action === 'SKIP') return 'LOW';
+
+    // HIGH: strong regime + high confidence + good Kelly
+    if (
+      decision.regime === 'Trending' &&
+      decision.confidence >= 0.6 &&
+      decision.kelly.kellyFraction >= 0.05
+    ) {
+      return 'HIGH';
+    }
+
+    if (isFastCheck && decision.aiScore >= 70) return 'HIGH';
+    if (decision.aiScore >= 80 || (liquiditySol >= 50 && decision.aiScore >= 70)) return 'HIGH';
+    if (decision.aiScore >= 65) return 'MEDIUM';
+
+    return 'LOW';
+  }
+
+  /**
+   * Legacy priority (kept for backward compat / linear score comparison)
    */
   private determinePriority(
     finalScore: number,
     liquiditySol: number,
-    isFastCheck: boolean
+    isFastCheck: boolean,
   ): 'HIGH' | 'MEDIUM' | 'LOW' {
-    if (isFastCheck && finalScore >= 70) {
-      return 'HIGH';
-    }
-
-    if (finalScore >= 80 || (liquiditySol >= 50 && finalScore >= 70)) {
-      return 'HIGH';
-    }
-
-    if (finalScore >= 70) {
-      return 'MEDIUM';
-    }
-
+    if (isFastCheck && finalScore >= 70) return 'HIGH';
+    if (finalScore >= 80 || (liquiditySol >= 50 && finalScore >= 70)) return 'HIGH';
+    if (finalScore >= 70) return 'MEDIUM';
     return 'LOW';
   }
 

@@ -1,4 +1,4 @@
-import { Connection, PublicKey, VersionedTransaction, type TokenLargestAccountsResult } from '@solana/web3.js';
+import { Connection, PublicKey, VersionedTransaction } from '@solana/web3.js';
 import { getMint, getAccount, TokenAccountNotFoundError, TokenInvalidAccountOwnerError } from '@solana/spl-token';
 import { createJupiterApiClient, type QuoteResponse, type SwapResponse } from '@jup-ag/api';
 import type { SecurityReport } from '../types/index.js';
@@ -105,13 +105,7 @@ export class Guard {
       }
     };
 
-    const [
-      mintWrapped,
-      top10Wrapped,
-      honeypotWrapped,
-      liquidityWrapped,
-      lpBurnedWrapped,
-    ] = await Promise.allSettled([
+    const wrappedResults = await Promise.allSettled([
       wrapWithTiming(this.safeGetMint(mintPubkey)),
       wrapWithTiming(this.calculateTop10HoldersPercent(mintPubkey)),
       wrapWithTiming(this.detectHoneypot(mintPubkey)),
@@ -121,9 +115,34 @@ export class Guard {
       results.map((r) =>
         r.status === 'fulfilled'
           ? r.value
-          : { result: { status: 'rejected' as const, reason: r.reason }, ms: 0 },
+          : { result: { status: 'rejected' as const, reason: (r as PromiseRejectedResult).reason }, ms: 0 },
       ),
     );
+
+    const FALLBACK_WRAPPED = {
+      result: { status: 'rejected' as const, reason: 'missing' },
+      ms: 0,
+    };
+    const mintWrapped = (wrappedResults[0] ?? FALLBACK_WRAPPED) as {
+      result: PromiseSettledResult<Awaited<ReturnType<Guard['safeGetMint']>>>;
+      ms: number;
+    };
+    const top10Wrapped = (wrappedResults[1] ?? FALLBACK_WRAPPED) as {
+      result: PromiseSettledResult<number>;
+      ms: number;
+    };
+    const honeypotWrapped = (wrappedResults[2] ?? FALLBACK_WRAPPED) as {
+      result: PromiseSettledResult<boolean>;
+      ms: number;
+    };
+    const liquidityWrapped = (wrappedResults[3] ?? FALLBACK_WRAPPED) as {
+      result: PromiseSettledResult<{ hasLiquidity: boolean; liquiditySol?: number }>;
+      ms: number;
+    };
+    const lpBurnedWrapped = (wrappedResults[4] ?? FALLBACK_WRAPPED) as {
+      result: PromiseSettledResult<number>;
+      ms: number;
+    };
 
     const mintInfoResult = mintWrapped.result;
     const top10Result = top10Wrapped.result;
@@ -310,7 +329,7 @@ export class Guard {
   private async calculateTop10HoldersPercent(mintPubkey: PublicKey): Promise<number> {
     const t0 = performance.now();
     try {
-      const largestAccounts: TokenLargestAccountsResult = await this.rpcRace((conn) =>
+      const largestAccounts = await this.rpcRace((conn) =>
         conn.getTokenLargestAccounts(mintPubkey),
       );
 
@@ -372,8 +391,8 @@ export class Guard {
    * @returns true si honeypot détecté (swap échoue en simulation)
    */
   private async detectHoneypot(mintPubkey: PublicKey): Promise<boolean> {
+    const t0Honeypot = performance.now();
     try {
-      const t0Honeypot = performance.now();
       const inputMint = SOL_MINT; // On achète avec SOL
       const outputMint = mintPubkey.toBase58();
       const amount = 1000000; // 0.001 SOL (1M lamports)
@@ -490,92 +509,65 @@ export class Guard {
   /**
    * Vérifie la liquidité sur Raydium AMM v4
    * 
-   * Récupère le solde du vault SOL du pool pour évaluer la liquidité disponible.
-   * 
-   * @param mintPubkey - PublicKey du mint token
-   * @returns Informations sur la liquidité (SOL amount et existence du pool)
+  * Utilise DexScreener pour estimer l'existence d'un pool et la liquidité.
    */
   private async checkRaydiumLiquidity(mintPubkey: PublicKey): Promise<{
     hasLiquidity: boolean;
     liquiditySol?: number;
   }> {
     try {
+      const mint = mintPubkey.toBase58();
       const t0Liq = performance.now();
-      const liquidityPromise = async (): Promise<{
-        hasLiquidity: boolean;
-        liquiditySol?: number;
-      }> => {
-        const pools = await this.rpcRace((conn) =>
-          conn.getProgramAccounts(RAYDIUM_AMM_V4_PROGRAM_ID, {
-            filters: [
-              {
-                dataSize: 752,
-              },
-            ],
-          }),
-        );
 
-        // Parcourt les pools pour trouver celui qui correspond au token
-        for (const pool of pools) {
-          try {
-            // Parse les données du pool (structure Raydium AMM v4)
-            const data = pool.account.data;
-            
-            // Offset 400: baseMint (32 bytes)
-            // Offset 432: quoteMint (32 bytes)
-            const baseMint = new PublicKey(data.slice(400, 432));
-            const quoteMint = new PublicKey(data.slice(432, 464));
+      const resp = await fetch(
+        `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
+        { signal: AbortSignal.timeout(3_000) },
+      );
 
-            // Vérifie si c'est le bon pool (token/SOL ou SOL/token)
-            const solMintPubkey = new PublicKey(SOL_MINT);
-            const isMatchingPool = 
-              (baseMint.equals(mintPubkey) && quoteMint.equals(solMintPubkey)) ||
-              (baseMint.equals(solMintPubkey) && quoteMint.equals(mintPubkey));
-
-            if (isMatchingPool) {
-              // Offset 464: baseVault (32 bytes)
-              // Offset 496: quoteVault (32 bytes)
-              const baseVault = new PublicKey(data.slice(464, 496));
-              const quoteVault = new PublicKey(data.slice(496, 528));
-
-              // Détermine quel vault contient le SOL
-              const solVault = baseMint.equals(solMintPubkey) ? baseVault : quoteVault;
-
-              const vaultBalance = await this.rpcRace((conn) => conn.getBalance(solVault));
-              const liquiditySol = vaultBalance / 1e9; // Convertit lamports en SOL
-
-              console.log(
-                `🛡️ [Guard] Liquidity check: ${(performance.now() - t0Liq).toFixed(2)}ms`,
-              );
-              return {
-                hasLiquidity: true,
-                liquiditySol,
-              };
-            }
-          } catch (err) {
-            // Ignore les erreurs de parsing pour ce pool spécifique
-            continue;
-          }
-        }
-
-        // Aucun pool trouvé
+      if (!resp.ok) {
         console.log(
           `🛡️ [Guard] Liquidity check: ${(performance.now() - t0Liq).toFixed(2)}ms`,
         );
         return { hasLiquidity: false };
+      }
+
+      const data = (await resp.json()) as {
+        pairs?: Array<{
+          chainId?: string;
+          liquidity?: { usd?: number };
+        }>;
       };
 
-      const timeout = new Promise<{ hasLiquidity: false }>((resolve) =>
-        setTimeout(() => {
-          console.warn('⚠️ [Guard] Liquidity check timeout — assuming no liquidity');
-          console.log(
-            `🛡️ [Guard] Liquidity check: ${(performance.now() - t0Liq).toFixed(2)}ms`,
-          );
-          resolve({ hasLiquidity: false });
-        }, 6000),
+      const pairs = data.pairs ?? [];
+      const solanaPairs = pairs.filter((p) => p.chainId === 'solana');
+
+      if (solanaPairs.length === 0) {
+        console.log(
+          `🛡️ [Guard] Liquidity check: ${(performance.now() - t0Liq).toFixed(2)}ms`,
+        );
+        return { hasLiquidity: false };
+      }
+
+      const bestPair = solanaPairs.reduce((best, p) =>
+        (p.liquidity?.usd ?? 0) > (best.liquidity?.usd ?? 0) ? p : best,
       );
 
-      return Promise.race([liquidityPromise(), timeout]);
+      const liquidityUsd = bestPair.liquidity?.usd ?? 0;
+      const SOL_PRICE_USD = 150;
+      const liquiditySol = liquidityUsd / SOL_PRICE_USD;
+
+      console.log(
+        `🛡️ [Guard] Liquidity check: ${(performance.now() - t0Liq).toFixed(2)}ms`,
+      );
+
+      if (liquiditySol <= 0) {
+        return { hasLiquidity: false };
+      }
+
+      return {
+        hasLiquidity: true,
+        liquiditySol,
+      };
     } catch (error) {
       console.error('Erreur lors de la vérification de liquidité Raydium:', error);
       const t0Liq = performance.now();

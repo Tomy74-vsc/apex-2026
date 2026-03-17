@@ -1,0 +1,1 @@
+C:\Users\tomre\bot\ trading\rust_core\target\release\apex_core.dll: C:\Users\tomre\bot\ trading\rust_core\src\ffi.rs C:\Users\tomre\bot\ trading\rust_core\src\lib.rs C:\Users\tomre\bot\ trading\rust_core\src\types.rs C:\Users\tomre\bot\ trading\rust_core\src\utils.rs

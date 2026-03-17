@@ -18,7 +18,16 @@ import { DecisionCore } from './engine/DecisionCore.js';
 import { TelegramPulse } from './ingestors/TelegramPulse.js';
 import { PumpScanner } from './ingestors/PumpScanner.js';
 import { Sniper } from './executor/Sniper.js';
-import type { ScoredToken, MarketEvent } from './types/index.js';
+import { getFeatureStore } from './data/FeatureStore.js';
+import { getPriceTracker } from './data/PriceTracker.js';
+import { getAIBrain } from './engine/AIBrain.js';
+import { getModelUpdater } from './engine/ModelUpdater.js';
+import { getShadowAgent } from './engine/ShadowAgent.js';
+import type {
+  ScoredToken,
+  MarketEvent,
+  TokenEventRecord,
+} from './types/index.js';
 
 /**
  * Configuration depuis variables d'environnement
@@ -148,6 +157,49 @@ class APEXBot {
       console.log(`📊 Token scoré: ${token.token.symbol} (score: ${token.finalScore}, priority: ${token.priority})`);
     });
 
+    // ── FeatureStore : enregistre chaque décision (cold path non-bloquant) ────
+    this.decisionCore.on('tokenScored', (token: ScoredToken) => {
+      try {
+        const store = getFeatureStore();
+        const record: TokenEventRecord = {
+          id: crypto.randomUUID(),
+          mint: token.token.mint,
+          t_source: token.t_source ?? token.timestamp ?? Date.now(),
+          t_recv: token.t_recv ?? Date.now(),
+          t_act: token.t_act ?? Date.now(),
+          featuresJson: '[]',
+          linearScore: token.finalScore,
+          onnxScore: null,
+          activeScore: token.finalScore,
+          shadowMode: 'linear_only',
+          liquiditySol: token.initialLiquiditySol,
+          riskScore: token.security.riskScore,
+          priority: token.priority,
+          decision: 'SKIP',
+          isFastCheck: false,
+          detectionMs: token.latency?.detectionMs ?? null,
+          guardMs: token.latency?.guardMs ?? null,
+          scoringMs: token.latency?.scoringMs ?? null,
+          totalMs: token.latency?.totalMs ?? null,
+          createdAt: Date.now(),
+        };
+        store.appendEvent(record);
+      } catch {
+        // cold path silencieux
+      }
+
+      // PriceTracker : programme les checks de prix multi-horizon (cold path)
+      try {
+        getPriceTracker().track(
+          token.token.mint,
+          token.initialPriceUsdc,
+          token.t_act ?? Date.now(),
+        );
+      } catch {
+        // silencieux
+      }
+    });
+
     // Événement : Prêt à sniper
     this.decisionCore.on('readyToSnipe', async (token: ScoredToken) => {
       if (!this.sniper) {
@@ -265,6 +317,14 @@ class APEXBot {
         }
       }
 
+      // Démarre ModelUpdater (hot-swap watcher, cold path)
+      try {
+        await getModelUpdater().start();
+        console.log('✅ ModelUpdater démarré\n');
+      } catch {
+        console.log('⚠️  ModelUpdater désactivé\n');
+      }
+
       // Démarre le tableau de bord
       this.startDashboard();
 
@@ -324,6 +384,13 @@ class APEXBot {
       } catch (error) {
         console.error('❌ Erreur lors de l\'arrêt TelegramPulse:', error);
       }
+    }
+
+    // Arrête ModelUpdater
+    try {
+      getModelUpdater().stop();
+    } catch {
+      // silencieux
     }
 
     console.log('✅ Arrêt terminé');
@@ -392,6 +459,24 @@ class APEXBot {
       console.log(`   Montant swap: ${sniperConfig.swapAmountSol} SOL`);
       console.log(`   Slippage: ${sniperConfig.slippageBps / 100}%`);
     }
+    console.log('');
+    const brainStats = getAIBrain().getStats();
+    console.log('🧠 AIBrain:');
+    console.log(`   Decisions: ${brainStats.decisions} (BUY: ${brainStats.buys} / SKIP: ${brainStats.skips})`);
+    console.log(`   Buy rate: ${brainStats.buyRate}`);
+    console.log(`   Avg latency: ${brainStats.avgLatencyMs.toFixed(2)}ms`);
+    console.log(`   Avg score: ${brainStats.avgScore.toFixed(1)}`);
+    console.log('');
+    const shadowStats = getShadowAgent().getStats();
+    console.log('👻 Shadow Agent:');
+    console.log(`   Decisions: ${shadowStats.totalDecisions}`);
+    console.log(`   Agreement: ${shadowStats.agreementRate.toFixed(1)}%`);
+    console.log(`   Shadow trades: ${shadowStats.shadowTradesLogged}`);
+    console.log('');
+    const modelStats = getModelUpdater().getStats();
+    console.log('🔄 ModelUpdater:');
+    console.log(`   Swaps: ${modelStats.swapCount}`);
+    console.log(`   Active: ${JSON.stringify(modelStats.activeModels)}`);
     console.log('═'.repeat(60) + '\n');
   }
 
@@ -456,6 +541,12 @@ async function main() {
     console.log(`\n\n📡 Signal ${signal} reçu`);
     if (bot) {
       await bot.shutdown();
+    }
+    // Flush FeatureStore avant fermeture (cold path)
+    try {
+      await getFeatureStore().close();
+    } catch {
+      // silencieux
     }
     process.exit(0);
   };

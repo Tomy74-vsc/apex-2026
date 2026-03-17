@@ -1,5 +1,5 @@
-import { Connection, PublicKey, VersionedTransaction } from '@solana/web3.js';
-import { getMint, getAccount, TOKEN_PROGRAM_ID, TokenAccountNotFoundError, TokenInvalidAccountOwnerError } from '@solana/spl-token';
+import { Connection, PublicKey, VersionedTransaction, type TokenLargestAccountsResult } from '@solana/web3.js';
+import { getMint, getAccount, TokenAccountNotFoundError, TokenInvalidAccountOwnerError } from '@solana/spl-token';
 import { createJupiterApiClient, type QuoteResponse, type SwapResponse } from '@jup-ag/api';
 import type { SecurityReport } from '../types/index.js';
 
@@ -15,6 +15,26 @@ const BURN_ADDRESSES = [
   '1nc1nerator11111111111111111111111111111111', // Incinerator
 ];
 
+type GuardStats = {
+  totalChecks: number;
+  // EWMA latence totale parallèle (ms)
+  avgParallelLatencyMs: number;
+  // EWMA somme des latences individuelles (ms) — ce que ça aurait pris en série
+  avgSerialLatencyMs: number;
+  // Gain réel = avgSerialLatencyMs / avgParallelLatencyMs
+  // Ex: 3.2 = le parallèle est 3.2× plus rapide que le série
+  parallelGain: number;
+};
+
+const guardStatsInternal: GuardStats = {
+  totalChecks: 0,
+  avgParallelLatencyMs: 0,
+  avgSerialLatencyMs: 0,
+  parallelGain: 1,
+};
+
+const EWMA_ALPHA = 0.1;
+
 /**
  * Guard - Analyseur de sécurité on-chain pour tokens Solana
  * 
@@ -22,20 +42,23 @@ const BURN_ADDRESSES = [
  * calcule un riskScore basé sur la concentration des holders et la liquidité.
  */
 export class Guard {
-  private connection: Connection;
   private jupiterApi: ReturnType<typeof createJupiterApiClient>;
+  private rpcEndpoints: string[];
 
   constructor(rpcUrl?: string) {
-    const heliusRpc = rpcUrl || process.env.HELIUS_RPC_URL || process.env.RPC_URL;
-    
-    if (!heliusRpc) {
-      throw new Error('HELIUS_RPC_URL ou RPC_URL doit être défini dans .env');
+    const envRpcs = [
+      rpcUrl,
+      process.env.HELIUS_RPC_URL,
+      process.env.QUICKNODE_RPC_URL,
+      process.env.BACKUP_RPC_URL,
+      process.env.RPC_URL,
+    ].filter((v): v is string => !!v);
+
+    if (envRpcs.length === 0) {
+      throw new Error('HELIUS_RPC_URL, QUICKNODE_RPC_URL, BACKUP_RPC_URL ou RPC_URL doit être défini dans .env');
     }
 
-    this.connection = new Connection(heliusRpc, {
-      commitment: 'confirmed',
-      confirmTransactionInitialTimeout: 30000,
-    });
+    this.rpcEndpoints = Array.from(new Set(envRpcs));
 
     // Initialise l'API Jupiter
     this.jupiterApi = createJupiterApiClient();
@@ -58,54 +81,166 @@ export class Guard {
    * @returns SecurityReport avec riskScore et flags de sécurité
    */
   async analyzeToken(mint: string): Promise<SecurityReport> {
+    const startedAt = performance.now();
     const mintPubkey = new PublicKey(mint);
     const flags: string[] = [];
     let riskScore = 0;
+    const mintShort = mint.slice(0, 8);
 
-    // 1. Vérification des autorités (MintAuthority & FreezeAuthority)
-    const mintInfo = await getMint(this.connection, mintPubkey);
-    const mintRenounced = mintInfo.mintAuthority === null;
-    const freezeDisabled = mintInfo.freezeAuthority === null;
+    const wrapWithTiming = async <T>(
+      p: Promise<T>,
+    ): Promise<{ result: PromiseSettledResult<T>; ms: number }> => {
+      const t0 = performance.now();
+      try {
+        const value = await p;
+        return {
+          result: { status: 'fulfilled', value } as PromiseFulfilledResult<T>,
+          ms: performance.now() - t0,
+        };
+      } catch (reason) {
+        return {
+          result: { status: 'rejected', reason } as PromiseRejectedResult,
+          ms: performance.now() - t0,
+        };
+      }
+    };
 
-    if (!mintRenounced) {
-      flags.push('MINT_AUTHORITY_NOT_RENOUNCED');
+    const [
+      mintWrapped,
+      top10Wrapped,
+      honeypotWrapped,
+      liquidityWrapped,
+      lpBurnedWrapped,
+    ] = await Promise.allSettled([
+      wrapWithTiming(this.safeGetMint(mintPubkey)),
+      wrapWithTiming(this.calculateTop10HoldersPercent(mintPubkey)),
+      wrapWithTiming(this.detectHoneypot(mintPubkey)),
+      wrapWithTiming(this.checkRaydiumLiquidity(mintPubkey)),
+      wrapWithTiming(this.calculateLPBurnedPercent(mintPubkey)),
+    ]).then((results) =>
+      results.map((r) =>
+        r.status === 'fulfilled'
+          ? r.value
+          : { result: { status: 'rejected' as const, reason: r.reason }, ms: 0 },
+      ),
+    );
+
+    const mintInfoResult = mintWrapped.result;
+    const top10Result = top10Wrapped.result;
+    const honeypotResult = honeypotWrapped.result;
+    const liquidityResult = liquidityWrapped.result;
+    const lpBurnedResult = lpBurnedWrapped.result;
+
+    let mintRenounced = false;
+    let freezeDisabled = false;
+    let lpBurnedPercent = 0;
+    let top10HoldersPercent = 0;
+    let isHoneypot = true;
+    let liquidityInfo: { hasLiquidity: boolean; liquiditySol?: number } = { hasLiquidity: false };
+
+    if (mintInfoResult.status === 'fulfilled' && mintInfoResult.value) {
+      const mintInfo = mintInfoResult.value;
+      mintRenounced = mintInfo.mintAuthority === null;
+      freezeDisabled = mintInfo.freezeAuthority === null;
+
+      if (!mintRenounced) {
+        flags.push('MINT_AUTHORITY_NOT_RENOUNCED');
+      }
+      if (!freezeDisabled) {
+        flags.push('FREEZE_AUTHORITY_NOT_DISABLED');
+        riskScore += 50;
+      }
+    } else {
+      flags.push('MINT_INFO_UNAVAILABLE');
+      riskScore += 30;
     }
 
-    if (!freezeDisabled) {
-      flags.push('FREEZE_AUTHORITY_NOT_DISABLED');
-      riskScore += 50; // +50 si freeze n'est pas révoqué
+    if (top10Result.status === 'fulfilled') {
+      top10HoldersPercent = top10Result.value;
+      if (top10HoldersPercent > 50) {
+        flags.push('HIGH_CONCENTRATION');
+        riskScore += 30;
+      }
+    } else {
+      flags.push('TOP10_HOLDERS_CHECK_FAILED');
+      riskScore += 10;
     }
 
-    // 2. Analyse de la distribution des holders (Top 10)
-    const top10HoldersPercent = await this.calculateTop10HoldersPercent(mintPubkey);
-    
-    if (top10HoldersPercent > 50) {
-      flags.push('HIGH_CONCENTRATION');
-      riskScore += 30; // +30 si top 10 holders > 50%
+    if (honeypotResult.status === 'fulfilled') {
+      isHoneypot = honeypotResult.value;
+      if (isHoneypot) {
+        flags.push('HONEYPOT_DETECTED');
+        riskScore += 100;
+      }
+    } else {
+      flags.push('HONEYPOT_CHECK_FAILED');
+      riskScore += 40;
+      isHoneypot = true;
     }
 
-    // 3. Détection de honeypot via simulation de swap
-    const isHoneypot = await this.detectHoneypot(mintPubkey);
-    if (isHoneypot) {
-      flags.push('HONEYPOT_DETECTED');
-      riskScore += 100; // Honeypot = risque maximum
+    if (liquidityResult.status === 'fulfilled') {
+      liquidityInfo = liquidityResult.value;
+      if (!liquidityInfo.hasLiquidity) {
+        flags.push('NO_LIQUIDITY_POOL');
+        riskScore += 40;
+      } else if (liquidityInfo.liquiditySol !== undefined && liquidityInfo.liquiditySol < 5) {
+        flags.push('LOW_LIQUIDITY');
+        riskScore += 20;
+      }
+    } else {
+      flags.push('LIQUIDITY_CHECK_FAILED');
+      riskScore += 20;
     }
 
-    // 4. Vérification de la liquidité Raydium
-    const liquidityInfo = await this.checkRaydiumLiquidity(mintPubkey);
-    
-    if (!liquidityInfo.hasLiquidity) {
-      flags.push('NO_LIQUIDITY_POOL');
-      riskScore += 40; // +40 si pas de pool de liquidité
-    } else if (liquidityInfo.liquiditySol && liquidityInfo.liquiditySol < 5) {
-      flags.push('LOW_LIQUIDITY');
-      riskScore += 20; // +20 si liquidité < 5 SOL
+    if (lpBurnedResult.status === 'fulfilled') {
+      lpBurnedPercent = lpBurnedResult.value;
+    } else {
+      flags.push('LP_BURN_CHECK_FAILED');
+      lpBurnedPercent = 0;
     }
 
-    // 5. Calcul du LP burned (approximation via getProgramAccounts)
-    const lpBurnedPercent = await this.calculateLPBurnedPercent(mintPubkey);
+    const isSafe =
+      riskScore < 50 &&
+      !isHoneypot &&
+      mintRenounced &&
+      freezeDisabled &&
+      liquidityInfo.hasLiquidity === true;
 
-    const isSafe = riskScore < 50 && !isHoneypot && mintRenounced && freezeDisabled && liquidityInfo.hasLiquidity;
+    const parallelLatencyMs = performance.now() - startedAt;
+    const serialLatencyMs =
+      mintWrapped.ms +
+      top10Wrapped.ms +
+      honeypotWrapped.ms +
+      liquidityWrapped.ms +
+      lpBurnedWrapped.ms;
+    const checksCount = 5;
+
+    if (guardStatsInternal.totalChecks === 0) {
+      guardStatsInternal.avgParallelLatencyMs = parallelLatencyMs;
+      guardStatsInternal.avgSerialLatencyMs = serialLatencyMs;
+    } else {
+      guardStatsInternal.avgParallelLatencyMs =
+        EWMA_ALPHA * parallelLatencyMs +
+        (1 - EWMA_ALPHA) * guardStatsInternal.avgParallelLatencyMs;
+      guardStatsInternal.avgSerialLatencyMs =
+        EWMA_ALPHA * serialLatencyMs +
+        (1 - EWMA_ALPHA) * guardStatsInternal.avgSerialLatencyMs;
+    }
+
+    guardStatsInternal.totalChecks += 1;
+    guardStatsInternal.parallelGain =
+      guardStatsInternal.avgSerialLatencyMs /
+      Math.max(1, guardStatsInternal.avgParallelLatencyMs);
+
+    const statusEmoji = isSafe ? '✅' : '❌';
+    const gainDisplay = guardStatsInternal.parallelGain.toFixed(1);
+    console.log(
+      `${statusEmoji} Guard [${mintShort}] ${isSafe ? 'ok' : 'risk'} en ${parallelLatencyMs.toFixed(
+        0,
+      )}ms | checks: ${checksCount} parallel | serial_eq: ${serialLatencyMs.toFixed(
+        0,
+      )}ms | gain: ${gainDisplay}×`,
+    );
 
     return {
       mint,
@@ -125,77 +260,103 @@ export class Guard {
   }
 
   /**
+   * Course RPC sur tous les endpoints disponibles et retourne le premier résultat.
+   */
+  private async rpcRace<T>(fn: (connection: Connection) => Promise<T>): Promise<T> {
+    const connections = this.rpcEndpoints.map(
+      (url) =>
+        new Connection(url, {
+          commitment: 'confirmed',
+          confirmTransactionInitialTimeout: 30000,
+        }),
+    );
+
+    const tasks = connections.map((conn) => fn(conn));
+
+    try {
+      return await Promise.any(tasks);
+    } catch (error) {
+      const agg = error as AggregateError;
+      console.error(
+        '❌ [Guard] rpcRace failed across all endpoints:',
+        agg.errors ?? agg,
+      );
+      throw error;
+    }
+  }
+
+  /**
+   * getMint avec rpcRace et gestion d'erreur silencieuse.
+   */
+  private async safeGetMint(mintPubkey: PublicKey) {
+    try {
+      const t0 = performance.now();
+      const mintInfo = await this.rpcRace((conn) => getMint(conn, mintPubkey));
+      const ms = (performance.now() - t0).toFixed(2);
+      console.log(`🛡️ [Guard] Mint info: ${ms}ms`);
+      return mintInfo;
+    } catch (error) {
+      console.warn('⚠️ [Guard] safeGetMint failed:', error);
+      return null;
+    }
+  }
+
+  /**
    * Calcule le pourcentage détenu par les top 10 holders
    * 
    * @param mintPubkey - PublicKey du mint
    * @returns Pourcentage (0-100) détenu par les top 10 holders
    */
   private async calculateTop10HoldersPercent(mintPubkey: PublicKey): Promise<number> {
+    const t0 = performance.now();
     try {
-      // Récupère tous les token accounts pour ce mint
-      // Offset 0 = mint address dans un token account
-      const tokenAccounts = await this.connection.getProgramAccounts(TOKEN_PROGRAM_ID, {
-        filters: [
-          {
-            dataSize: 165, // Taille d'un token account
-          },
-          {
-            memcmp: {
-              offset: 0, // Mint address offset dans token account
-              bytes: mintPubkey.toBase58(),
-            },
-          },
-        ],
-      });
+      const largestAccounts: TokenLargestAccountsResult = await this.rpcRace((conn) =>
+        conn.getTokenLargestAccounts(mintPubkey),
+      );
 
-      if (tokenAccounts.length === 0) {
+      if (!largestAccounts.value || largestAccounts.value.length === 0) {
         return 0;
       }
 
-      // Parse les balances depuis les accounts
-      const holders: { address: string; balance: bigint }[] = [];
-
-      for (const account of tokenAccounts) {
-        try {
-          const tokenAccount = await getAccount(this.connection, account.pubkey);
-          if (tokenAccount.amount > 0n) {
-            holders.push({
-              address: account.pubkey.toBase58(),
-              balance: tokenAccount.amount,
-            });
+      const balances: bigint[] = largestAccounts.value
+        .map((acc) => {
+          try {
+            return BigInt(acc.amount);
+          } catch {
+            return 0n;
           }
-        } catch (err) {
-          // Ignore les erreurs de parsing (accounts invalides)
-          if (!(err instanceof TokenAccountNotFoundError || err instanceof TokenInvalidAccountOwnerError)) {
-            throw err;
-          }
-        }
-      }
+        })
+        .filter((b) => b > 0n);
 
-      // Trie par balance décroissante
-      holders.sort((a, b) => {
-        if (b.balance > a.balance) return 1;
-        if (b.balance < a.balance) return -1;
-        return 0;
-      });
-
-      // Calcule le total supply
-      const mintInfo = await getMint(this.connection, mintPubkey);
-      const totalSupply = mintInfo.supply;
-
-      if (totalSupply === 0n) {
+      if (balances.length === 0) {
         return 0;
       }
 
-      // Somme des top 10 holders
-      const top10Balance = holders
-        .slice(0, 10)
-        .reduce((sum, holder) => sum + holder.balance, 0n);
+      balances.sort((a, b) => (b > a ? 1 : b < a ? -1 : 0));
+      const top10 = balances.slice(0, 10);
 
-      return Number((top10Balance * 100n) / totalSupply);
+      const mintInfo = await this.safeGetMint(mintPubkey);
+      if (!mintInfo || mintInfo.supply === 0n) {
+        return 0;
+      }
+
+      const top10Sum = top10.reduce((acc, b) => acc + b, 0n);
+      const percent = Number((top10Sum * 10000n) / mintInfo.supply) / 100;
+
+      const ms = (performance.now() - t0).toFixed(2);
+      console.log(
+        `🛡️ [Guard] Top10 analysis: ${ms}ms (${balances.length} holders, source=getTokenLargestAccounts)`,
+      );
+
+      return Math.min(percent, 100);
     } catch (error) {
-      console.error('Erreur lors du calcul des top holders:', error);
-      return 0; // En cas d'erreur, on assume 0% (safe par défaut)
+      const ms = (performance.now() - t0).toFixed(2);
+      console.error(
+        `❌ [Guard] calculateTop10 failed (${ms}ms): ${
+          error instanceof Error ? error.message : error
+        }`,
+      );
+      return 0;
     }
   }
 
@@ -212,6 +373,7 @@ export class Guard {
    */
   private async detectHoneypot(mintPubkey: PublicKey): Promise<boolean> {
     try {
+      const t0Honeypot = performance.now();
       const inputMint = SOL_MINT; // On achète avec SOL
       const outputMint = mintPubkey.toBase58();
       const amount = 1000000; // 0.001 SOL (1M lamports)
@@ -219,19 +381,37 @@ export class Guard {
       // 1. Vérifie si une route de swap existe
       let quote: QuoteResponse;
       try {
-        quote = await this.jupiterApi.quoteGet({
+        const quotePromise = this.jupiterApi.quoteGet({
           inputMint,
           outputMint,
           amount,
           slippageBps: 50, // 0.5% slippage
         });
+        const timeout = new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Jupiter timeout')), 5000),
+        );
+        quote = (await Promise.race([quotePromise, timeout])) as QuoteResponse;
       } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        if (msg.includes('timeout')) {
+          console.warn('⚠️ [Guard] Jupiter quote timeout — assuming not honeypot');
+          console.log(
+            `🛡️ [Guard] Honeypot check: ${(performance.now() - t0Honeypot).toFixed(2)}ms`,
+          );
+          return false; // timeout ≠ honeypot, on laisse passer
+        }
         // Pas de route disponible = probable honeypot
+        console.log(
+          `🛡️ [Guard] Honeypot check: ${(performance.now() - t0Honeypot).toFixed(2)}ms`,
+        );
         return true;
       }
 
       // 2. Si la quote retourne 0 output, c'est un honeypot
       if (!quote.outAmount || quote.outAmount === '0') {
+        console.log(
+          `🛡️ [Guard] Honeypot check: ${(performance.now() - t0Honeypot).toFixed(2)}ms`,
+        );
         return true;
       }
 
@@ -251,6 +431,9 @@ export class Guard {
         });
 
         if (!swapResponse.swapTransaction) {
+          console.log(
+            `🛡️ [Guard] Honeypot check: ${(performance.now() - t0Honeypot).toFixed(2)}ms`,
+          );
           return true; // Pas de transaction possible = honeypot
         }
 
@@ -258,13 +441,18 @@ export class Guard {
         const swapTransactionBuf = Buffer.from(swapResponse.swapTransaction, 'base64');
         const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
 
-        const simulation = await this.connection.simulateTransaction(transaction, {
-          replaceRecentBlockhash: true,
-          sigVerify: false,
-        });
+        const simulation = await this.rpcRace((conn) =>
+          conn.simulateTransaction(transaction, {
+            replaceRecentBlockhash: true,
+            sigVerify: false,
+          }),
+        );
 
         // Si la simulation échoue, c'est probablement un honeypot
         if (simulation.value.err) {
+          console.log(
+            `🛡️ [Guard] Honeypot check: ${(performance.now() - t0Honeypot).toFixed(2)}ms`,
+          );
           return true;
         }
 
@@ -278,14 +466,23 @@ export class Guard {
             log.includes('unauthorized')
         );
 
+        console.log(
+          `🛡️ [Guard] Honeypot check: ${(performance.now() - t0Honeypot).toFixed(2)}ms`,
+        );
         return hasTransferError;
       } catch (error) {
         // Erreur lors de la création/simulation = probable honeypot
+        console.log(
+          `🛡️ [Guard] Honeypot check: ${(performance.now() - t0Honeypot).toFixed(2)}ms`,
+        );
         return true;
       }
     } catch (error) {
       // Si la simulation échoue complètement, on considère que c'est un honeypot
       console.warn('Erreur lors de la simulation de swap:', error);
+      console.log(
+        `🛡️ [Guard] Honeypot check: ${(performance.now() - t0Honeypot).toFixed(2)}ms`,
+      );
       return true;
     }
   }
@@ -303,60 +500,88 @@ export class Guard {
     liquiditySol?: number;
   }> {
     try {
-      // Recherche des pools Raydium AMM v4 contenant ce token
-      const pools = await this.connection.getProgramAccounts(RAYDIUM_AMM_V4_PROGRAM_ID, {
-        filters: [
-          {
-            dataSize: 752, // Taille d'un Raydium AMM v4 pool state
-          },
-        ],
-      });
+      const t0Liq = performance.now();
+      const liquidityPromise = async (): Promise<{
+        hasLiquidity: boolean;
+        liquiditySol?: number;
+      }> => {
+        const pools = await this.rpcRace((conn) =>
+          conn.getProgramAccounts(RAYDIUM_AMM_V4_PROGRAM_ID, {
+            filters: [
+              {
+                dataSize: 752,
+              },
+            ],
+          }),
+        );
 
-      // Parcourt les pools pour trouver celui qui correspond au token
-      for (const pool of pools) {
-        try {
-          // Parse les données du pool (structure Raydium AMM v4)
-          const data = pool.account.data;
-          
-          // Offset 400: baseMint (32 bytes)
-          // Offset 432: quoteMint (32 bytes)
-          const baseMint = new PublicKey(data.slice(400, 432));
-          const quoteMint = new PublicKey(data.slice(432, 464));
+        // Parcourt les pools pour trouver celui qui correspond au token
+        for (const pool of pools) {
+          try {
+            // Parse les données du pool (structure Raydium AMM v4)
+            const data = pool.account.data;
+            
+            // Offset 400: baseMint (32 bytes)
+            // Offset 432: quoteMint (32 bytes)
+            const baseMint = new PublicKey(data.slice(400, 432));
+            const quoteMint = new PublicKey(data.slice(432, 464));
 
-          // Vérifie si c'est le bon pool (token/SOL ou SOL/token)
-          const solMintPubkey = new PublicKey(SOL_MINT);
-          const isMatchingPool = 
-            (baseMint.equals(mintPubkey) && quoteMint.equals(solMintPubkey)) ||
-            (baseMint.equals(solMintPubkey) && quoteMint.equals(mintPubkey));
+            // Vérifie si c'est le bon pool (token/SOL ou SOL/token)
+            const solMintPubkey = new PublicKey(SOL_MINT);
+            const isMatchingPool = 
+              (baseMint.equals(mintPubkey) && quoteMint.equals(solMintPubkey)) ||
+              (baseMint.equals(solMintPubkey) && quoteMint.equals(mintPubkey));
 
-          if (isMatchingPool) {
-            // Offset 464: baseVault (32 bytes)
-            // Offset 496: quoteVault (32 bytes)
-            const baseVault = new PublicKey(data.slice(464, 496));
-            const quoteVault = new PublicKey(data.slice(496, 528));
+            if (isMatchingPool) {
+              // Offset 464: baseVault (32 bytes)
+              // Offset 496: quoteVault (32 bytes)
+              const baseVault = new PublicKey(data.slice(464, 496));
+              const quoteVault = new PublicKey(data.slice(496, 528));
 
-            // Détermine quel vault contient le SOL
-            const solVault = baseMint.equals(solMintPubkey) ? baseVault : quoteVault;
+              // Détermine quel vault contient le SOL
+              const solVault = baseMint.equals(solMintPubkey) ? baseVault : quoteVault;
 
-            // Récupère le solde du vault SOL
-            const vaultBalance = await this.connection.getBalance(solVault);
-            const liquiditySol = vaultBalance / 1e9; // Convertit lamports en SOL
+              const vaultBalance = await this.rpcRace((conn) => conn.getBalance(solVault));
+              const liquiditySol = vaultBalance / 1e9; // Convertit lamports en SOL
 
-            return {
-              hasLiquidity: true,
-              liquiditySol,
-            };
+              console.log(
+                `🛡️ [Guard] Liquidity check: ${(performance.now() - t0Liq).toFixed(2)}ms`,
+              );
+              return {
+                hasLiquidity: true,
+                liquiditySol,
+              };
+            }
+          } catch (err) {
+            // Ignore les erreurs de parsing pour ce pool spécifique
+            continue;
           }
-        } catch (err) {
-          // Ignore les erreurs de parsing pour ce pool spécifique
-          continue;
         }
-      }
 
-      // Aucun pool trouvé
-      return { hasLiquidity: false };
+        // Aucun pool trouvé
+        console.log(
+          `🛡️ [Guard] Liquidity check: ${(performance.now() - t0Liq).toFixed(2)}ms`,
+        );
+        return { hasLiquidity: false };
+      };
+
+      const timeout = new Promise<{ hasLiquidity: false }>((resolve) =>
+        setTimeout(() => {
+          console.warn('⚠️ [Guard] Liquidity check timeout — assuming no liquidity');
+          console.log(
+            `🛡️ [Guard] Liquidity check: ${(performance.now() - t0Liq).toFixed(2)}ms`,
+          );
+          resolve({ hasLiquidity: false });
+        }, 6000),
+      );
+
+      return Promise.race([liquidityPromise(), timeout]);
     } catch (error) {
       console.error('Erreur lors de la vérification de liquidité Raydium:', error);
+      const t0Liq = performance.now();
+      console.log(
+        `🛡️ [Guard] Liquidity check: ${(performance.now() - t0Liq).toFixed(2)}ms`,
+      );
       return { hasLiquidity: false };
     }
   }
@@ -371,68 +596,100 @@ export class Guard {
    */
   private async calculateLPBurnedPercent(mintPubkey: PublicKey): Promise<number> {
     try {
-      // Recherche des pools Raydium pour ce token
-      const pools = await this.connection.getProgramAccounts(RAYDIUM_AMM_V4_PROGRAM_ID, {
-        filters: [
-          {
-            dataSize: 752,
-          },
-        ],
-      });
+      const t0LP = performance.now();
+      const lpPromise = async (): Promise<number> => {
+        const pools = await this.rpcRace((conn) =>
+          conn.getProgramAccounts(RAYDIUM_AMM_V4_PROGRAM_ID, {
+            filters: [
+              {
+                dataSize: 752,
+              },
+            ],
+          }),
+        );
 
-      for (const pool of pools) {
-        try {
-          const data = pool.account.data;
-          const baseMint = new PublicKey(data.slice(400, 432));
-          const quoteMint = new PublicKey(data.slice(432, 464));
+        for (const pool of pools) {
+          try {
+            const data = pool.account.data;
+            const baseMint = new PublicKey(data.slice(400, 432));
+            const quoteMint = new PublicKey(data.slice(432, 464));
 
-          const solMintPubkey = new PublicKey(SOL_MINT);
-          const isMatchingPool = 
-            (baseMint.equals(mintPubkey) && quoteMint.equals(solMintPubkey)) ||
-            (baseMint.equals(solMintPubkey) && quoteMint.equals(mintPubkey));
+            const solMintPubkey = new PublicKey(SOL_MINT);
+            const isMatchingPool = 
+              (baseMint.equals(mintPubkey) && quoteMint.equals(solMintPubkey)) ||
+              (baseMint.equals(solMintPubkey) && quoteMint.equals(mintPubkey));
 
-          if (isMatchingPool) {
-            // Offset 528: lpMint (32 bytes)
-            const lpMint = new PublicKey(data.slice(528, 560));
+            if (isMatchingPool) {
+              // Offset 528: lpMint (32 bytes)
+              const lpMint = new PublicKey(data.slice(528, 560));
 
-            // Récupère le total supply du LP token
-            const lpMintInfo = await getMint(this.connection, lpMint);
-            const totalSupply = lpMintInfo.supply;
+              const lpMintInfo = await this.rpcRace((conn) => getMint(conn, lpMint));
+              const totalSupply = lpMintInfo.supply;
 
-            if (totalSupply === 0n) {
-              return 100; // Tout est brûlé
-            }
-
-            // Vérifie combien de LP tokens sont dans les adresses de burn
-            let burnedAmount = 0n;
-
-            for (const burnAddress of BURN_ADDRESSES) {
-              try {
-                const burnPubkey = new PublicKey(burnAddress);
-                const tokenAccounts = await this.connection.getTokenAccountsByOwner(burnPubkey, {
-                  mint: lpMint,
-                });
-
-                for (const account of tokenAccounts.value) {
-                  const tokenAccount = await getAccount(this.connection, account.pubkey);
-                  burnedAmount += tokenAccount.amount;
-                }
-              } catch {
-                // Ignore si l'adresse n'a pas de token account
-                continue;
+              if (totalSupply === 0n) {
+                console.log(
+                  `🛡️ [Guard] LP burn check: ${(performance.now() - t0LP).toFixed(2)}ms`,
+                );
+                return 100; // Tout est brûlé
               }
+
+              // Vérifie combien de LP tokens sont dans les adresses de burn
+              let burnedAmount = 0n;
+
+              for (const burnAddress of BURN_ADDRESSES) {
+                try {
+                  const burnPubkey = new PublicKey(burnAddress);
+                  const tokenAccounts = await this.rpcRace((conn) =>
+                    conn.getTokenAccountsByOwner(burnPubkey, {
+                      mint: lpMint,
+                    }),
+                  );
+
+                    for (const account of tokenAccounts.value) {
+                      const tokenAccount = await this.rpcRace((conn) =>
+                        getAccount(conn, account.pubkey),
+                      );
+                      burnedAmount += tokenAccount.amount;
+                    }
+                } catch {
+                  // Ignore si l'adresse n'a pas de token account
+                  continue;
+                }
+              }
+
+              console.log(
+                `🛡️ [Guard] LP burn check: ${(performance.now() - t0LP).toFixed(2)}ms`,
+              );
+              return Number((burnedAmount * 100n) / totalSupply);
             }
-
-            return Number((burnedAmount * 100n) / totalSupply);
+          } catch {
+            continue;
           }
-        } catch {
-          continue;
         }
-      }
 
-      return 0; // Pool non trouvé
+        console.log(
+          `🛡️ [Guard] LP burn check: ${(performance.now() - t0LP).toFixed(2)}ms`,
+        );
+        return 0; // Pool non trouvé
+      };
+
+      const timeout = new Promise<number>((resolve) =>
+        setTimeout(() => {
+          console.warn('⚠️ [Guard] LP burn check timeout — assuming 0% burned');
+          console.log(
+            `🛡️ [Guard] LP burn check: ${(performance.now() - t0LP).toFixed(2)}ms`,
+          );
+          resolve(0);
+        }, 6000),
+      );
+
+      return Promise.race([lpPromise(), timeout]);
     } catch (error) {
       console.error('Erreur lors du calcul du LP burned:', error);
+      const t0LP = performance.now();
+      console.log(
+        `🛡️ [Guard] LP burn check: ${(performance.now() - t0LP).toFixed(2)}ms`,
+      );
       return 0;
     }
   }

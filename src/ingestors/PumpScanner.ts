@@ -151,6 +151,9 @@ export class PumpScanner extends EventEmitter {
    * @param context - Contexte (slot, etc.)
    */
   private async handleLogs(logs: any, context: any): Promise<void> {
+    // ⚡ t_recv : capturé immédiatement — avant toute logique
+    const t_recv = Date.now();
+
     // Ignore les transactions échouées
     if (logs.err) {
       return;
@@ -190,7 +193,7 @@ export class PumpScanner extends EventEmitter {
 
     // Lance l'extraction du Mint depuis la transaction
     // Ne pas await pour ne pas bloquer la boucle d'événements
-    this.processTransaction(signature).catch(() => {
+    this.processTransaction(signature, t_recv).catch(() => {
       // Erreur silencieuse (gestion d'erreurs robuste)
     });
   }
@@ -204,8 +207,9 @@ export class PumpScanner extends EventEmitter {
    * - Crée un MarketEvent et émet newLaunch + fastCheck
    * 
    * @param signature - Signature de la transaction
+   * @param t_recv - Timestamp de réception locale
    */
-  private async processTransaction(signature: string): Promise<void> {
+  private async processTransaction(signature: string, t_recv: number): Promise<void> {
     try {
       // Récupère la transaction avec maxSupportedTransactionVersion: 0
       const tx = await this.connection.getTransaction(signature, {
@@ -230,13 +234,17 @@ export class PumpScanner extends EventEmitter {
       // Calcule la liquidité initiale (Pump.fun standard: ~30 SOL)
       const liquiditySol = this.calculateInitialLiquidity(tx);
 
+      const t_source: number = tx?.blockTime ? tx.blockTime * 1000 : t_recv;
+
       // Crée l'événement MarketEvent
       const marketEvent: MarketEvent = {
         token: tokenMetadata,
         poolId: `pump-${signature.slice(0, 8)}`, // ID unique basé sur signature
         initialLiquiditySol: liquiditySol,
         initialPriceUsdc: 0, // Prix initial Pump.fun très faible
-        timestamp: Date.now(),
+        timestamp: t_source,
+        t_source,
+        t_recv,
       };
 
       console.log(`[PumpScanner] 🆕 NewLaunch détecté!`);

@@ -2,7 +2,13 @@ import { EventEmitter } from 'events';
 import { MarketScanner } from '../ingestors/MarketScanner.js';
 import { Guard } from '../detectors/Guard.js';
 import { SocialPulse } from '../ingestors/SocialPulse.js';
-import type { MarketEvent, SecurityReport, ScoredToken, SocialSignal } from '../types/index.js';
+import type {
+  MarketEvent,
+  SecurityReport,
+  ScoredToken,
+  SocialSignal,
+  DecisionLatency,
+} from '../types/index.js';
 
 /**
  * Événements émis par le DecisionCore
@@ -134,24 +140,33 @@ export class DecisionCore extends EventEmitter {
   private async processToken(event: MarketEvent, isFastCheck: boolean): Promise<void> {
     this.tokensProcessed++;
 
+    // Fallbacks backward compatible
+    const t_source = event.t_source ?? event.timestamp ?? Date.now();
+    const t_recv = event.t_recv ?? Date.now();
+
     try {
-      const { token, poolId, initialLiquiditySol } = event;
+      const { token, initialLiquiditySol } = event;
 
       // Filtre 1 : Liquidité minimale
       if (initialLiquiditySol < this.minLiquidity) {
-        this.rejectToken(token.mint, `Liquidité insuffisante: ${initialLiquiditySol.toFixed(2)} SOL`);
+        this.rejectToken(
+          token.mint,
+          `Liquidité insuffisante: ${initialLiquiditySol.toFixed(2)} SOL`,
+        );
         return;
       }
 
-      // Analyse de sécurité via Guard
+      // Guard — mesure avec performance.now()
       console.log(`🔍 Analyse sécurité: ${token.mint}${isFastCheck ? ' [FAST]' : ''}`);
+      const guardStart = performance.now();
       const security: SecurityReport = await this.guard.validateToken(token.mint);
+      const guardMs = Math.round(performance.now() - guardStart);
 
       // Filtre 2 : Score de risque
       if (security.riskScore > this.maxRiskScore) {
         this.rejectToken(
           token.mint,
-          `Risk score trop élevé: ${security.riskScore} (max: ${this.maxRiskScore})`
+          `Risk score trop élevé: ${security.riskScore} (max: ${this.maxRiskScore})`,
         );
         return;
       }
@@ -163,12 +178,31 @@ export class DecisionCore extends EventEmitter {
       }
 
       // Récupère les signaux sociaux (si SocialPulse disponible)
-      const socialSignal = this.socialPulse 
+      const socialSignal = this.socialPulse
         ? await this.socialPulse.getSignal(token.mint)
         : null;
 
-      // Calcule le score final (inclut social signals si disponibles)
+      // Score — mesure avec performance.now()
+      const scoreStart = performance.now();
       const finalScore = this.calculateFinalScore(event, security, socialSignal, isFastCheck);
+      const scoringMs = Math.round((performance.now() - scoreStart) * 100) / 100; // 2 décimales
+
+      // t_act : timestamp absolu de la décision
+      const t_act = Date.now();
+      const totalMs = t_act - t_source;
+
+      // Latences complètes
+      const latency: DecisionLatency = {
+        detectionMs: Math.max(0, t_recv - t_source),
+        guardMs,
+        scoringMs,
+        totalMs: Math.max(0, totalMs),
+      };
+
+      // Log structuré Blueprint V2
+      console.log(
+        `⏱️  [${token.mint.slice(0, 8)}] detect=${latency.detectionMs}ms | guard=${latency.guardMs}ms | score=${latency.scoringMs}ms | TOTAL=${latency.totalMs}ms`,
+      );
 
       // Détermine la priorité
       const priority = this.determinePriority(finalScore, initialLiquiditySol, isFastCheck);
@@ -176,10 +210,12 @@ export class DecisionCore extends EventEmitter {
       // Crée le ScoredToken
       const scoredToken: ScoredToken = {
         ...event,
+        t_act,
         social: socialSignal,
         security,
         finalScore,
         priority,
+        latency, // nouveau champ optionnel
       };
 
       // Émet l'événement
@@ -188,7 +224,9 @@ export class DecisionCore extends EventEmitter {
       // Si score suffisant, prêt pour snipe
       if (finalScore >= 70 || (isFastCheck && finalScore >= 60)) {
         this.tokensAccepted++;
-        console.log(`✅ Token accepté: ${token.mint} (score: ${finalScore}, priorité: ${priority})`);
+        console.log(
+          `✅ Token accepté: ${token.mint} (score: ${finalScore}, priorité: ${priority})`,
+        );
         this.emit('readyToSnipe', scoredToken);
       } else {
         this.rejectToken(token.mint, `Score insuffisant: ${finalScore}`);

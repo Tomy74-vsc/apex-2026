@@ -20,6 +20,7 @@ import type {
   FeatureSnapshotRecord,
   TokenOutcomeRecord,
   ModelParamsRecord,
+  CurveSnapshotRecord,
 } from '../types/index.js';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -138,6 +139,70 @@ CREATE TABLE IF NOT EXISTS model_params (
 
 CREATE INDEX IF NOT EXISTS idx_model_params_type   ON model_params(model_type);
 CREATE INDEX IF NOT EXISTS idx_model_params_active ON model_params(is_active);
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- V3.1 Bonding Curve — Prediction Snapshots for ML training
+-- ═══════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS curve_snapshots (
+  id                    TEXT    PRIMARY KEY,
+  mint                  TEXT    NOT NULL,
+  timestamp_ms          INTEGER NOT NULL,
+
+  -- Curve state
+  progress              REAL    NOT NULL DEFAULT 0,
+  real_sol_sol          REAL    NOT NULL DEFAULT 0,
+  price_sol             REAL    NOT NULL DEFAULT 0,
+  market_cap_sol        REAL    NOT NULL DEFAULT 0,
+  tier                  TEXT    NOT NULL DEFAULT 'cold',
+  trade_count           INTEGER NOT NULL DEFAULT 0,
+
+  -- Prediction
+  p_grad                REAL    NOT NULL DEFAULT 0,
+  confidence            REAL    NOT NULL DEFAULT 0,
+  breakeven             REAL    NOT NULL DEFAULT 0,
+  action                TEXT    NOT NULL DEFAULT 'SKIP',
+  veto_reason           TEXT,
+
+  -- Velocity signals
+  sol_per_minute_1m     REAL    NOT NULL DEFAULT 0,
+  sol_per_minute_5m     REAL    NOT NULL DEFAULT 0,
+  avg_trade_size_sol    REAL    NOT NULL DEFAULT 0,
+  velocity_ratio        REAL    NOT NULL DEFAULT 0,
+
+  -- Bot / wallet signals
+  bot_transaction_ratio REAL    NOT NULL DEFAULT 0,
+  smart_money_buyer_cnt INTEGER NOT NULL DEFAULT 0,
+  creator_is_selling    INTEGER NOT NULL DEFAULT 0,
+  fresh_wallet_ratio    REAL    NOT NULL DEFAULT 0,
+
+  -- Latency
+  prediction_ms         REAL    NOT NULL DEFAULT 0,
+  created_at            INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_curve_snapshots_mint       ON curve_snapshots(mint);
+CREATE INDEX IF NOT EXISTS idx_curve_snapshots_ts         ON curve_snapshots(timestamp_ms);
+CREATE INDEX IF NOT EXISTS idx_curve_snapshots_action     ON curve_snapshots(action);
+CREATE INDEX IF NOT EXISTS idx_curve_snapshots_created_at ON curve_snapshots(created_at);
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- V3.1 Curve Outcomes — Graduation labeling for ML training
+-- ═══════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS curve_outcomes (
+  mint              TEXT    PRIMARY KEY,
+  graduated         INTEGER NOT NULL DEFAULT 0,
+  final_progress    REAL    NOT NULL DEFAULT 0,
+  final_sol         REAL    NOT NULL DEFAULT 0,
+  duration_s        REAL    NOT NULL DEFAULT 0,
+  eviction_reason   TEXT,
+  snapshots_count   INTEGER NOT NULL DEFAULT 0,
+  created_at        INTEGER NOT NULL,
+  resolved_at       INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_curve_outcomes_graduated ON curve_outcomes(graduated);
 `;
 
 // ─── Classe principale ────────────────────────────────────────────────────────
@@ -504,6 +569,196 @@ export class FeatureStore {
     } catch (err) {
       console.warn(`⚠️  [FeatureStore] getActiveModel error: ${err}`);
       return null;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V3.1 Curve Snapshots — Bonding Curve Prediction Logging
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  appendCurveSnapshot(snap: CurveSnapshotRecord): void {
+    if (this.isClosed) return;
+    try {
+      this.db.prepare(`
+        INSERT OR IGNORE INTO curve_snapshots (
+          id, mint, timestamp_ms,
+          progress, real_sol_sol, price_sol, market_cap_sol, tier, trade_count,
+          p_grad, confidence, breakeven, action, veto_reason,
+          sol_per_minute_1m, sol_per_minute_5m, avg_trade_size_sol, velocity_ratio,
+          bot_transaction_ratio, smart_money_buyer_cnt, creator_is_selling, fresh_wallet_ratio,
+          prediction_ms, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        snap.id, snap.mint, snap.timestampMs,
+        snap.progress, snap.realSolSOL, snap.priceSOL, snap.marketCapSOL, snap.tier, snap.tradeCount,
+        snap.pGrad, snap.confidence, snap.breakeven, snap.action, snap.vetoReason,
+        snap.solPerMinute1m, snap.solPerMinute5m, snap.avgTradeSizeSOL, snap.velocityRatio,
+        snap.botTransactionRatio, snap.smartMoneyBuyerCount, snap.creatorIsSelling, snap.freshWalletRatio,
+        snap.predictionMs, snap.createdAt,
+      );
+    } catch (err) {
+      this.stats.errors += 1;
+      console.warn(`⚠️  [FeatureStore] appendCurveSnapshot error: ${err}`);
+    }
+  }
+
+  queryCurveSnapshots(opts: {
+    since?: number;
+    mint?: string;
+    action?: string;
+    limit?: number;
+  } = {}): CurveSnapshotRecord[] {
+    try {
+      let sql = 'SELECT * FROM curve_snapshots WHERE 1=1';
+      const params: (string | number)[] = [];
+
+      if (opts.since !== undefined) {
+        sql += ' AND timestamp_ms >= ?';
+        params.push(opts.since);
+      }
+      if (opts.mint) {
+        sql += ' AND mint = ?';
+        params.push(opts.mint);
+      }
+      if (opts.action) {
+        sql += ' AND action = ?';
+        params.push(opts.action);
+      }
+      sql += ' ORDER BY timestamp_ms DESC';
+      if (opts.limit !== undefined) {
+        sql += ' LIMIT ?';
+        params.push(opts.limit);
+      }
+
+      const rows = this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+      return rows.map((r) => ({
+        id: r.id as string,
+        mint: r.mint as string,
+        timestampMs: r.timestamp_ms as number,
+        progress: r.progress as number,
+        realSolSOL: r.real_sol_sol as number,
+        priceSOL: r.price_sol as number,
+        marketCapSOL: r.market_cap_sol as number,
+        tier: r.tier as CurveSnapshotRecord['tier'],
+        tradeCount: r.trade_count as number,
+        pGrad: r.p_grad as number,
+        confidence: r.confidence as number,
+        breakeven: r.breakeven as number,
+        action: r.action as string,
+        vetoReason: r.veto_reason as string | null,
+        solPerMinute1m: r.sol_per_minute_1m as number,
+        solPerMinute5m: r.sol_per_minute_5m as number,
+        avgTradeSizeSOL: r.avg_trade_size_sol as number,
+        velocityRatio: r.velocity_ratio as number,
+        botTransactionRatio: r.bot_transaction_ratio as number,
+        smartMoneyBuyerCount: r.smart_money_buyer_cnt as number,
+        creatorIsSelling: r.creator_is_selling as number,
+        freshWalletRatio: r.fresh_wallet_ratio as number,
+        predictionMs: r.prediction_ms as number,
+        createdAt: r.created_at as number,
+      }));
+    } catch (err) {
+      console.warn(`⚠️  [FeatureStore] queryCurveSnapshots error: ${err}`);
+      return [];
+    }
+  }
+
+  getCurveSnapshotCount(): number {
+    try {
+      const row = this.db.prepare(
+        'SELECT COUNT(*) as cnt FROM curve_snapshots',
+      ).get() as { cnt: number } | null;
+      return row?.cnt ?? 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Label a mint's outcome (graduated or evicted).
+   * Called once per mint when CurveTracker emits 'graduated' or 'evicted'.
+   */
+  labelCurveOutcome(opts: {
+    mint: string;
+    graduated: boolean;
+    finalProgress: number;
+    finalSol: number;
+    durationS: number;
+    evictionReason?: string;
+  }): void {
+    if (this.isClosed) return;
+    try {
+      const snapCount = this.db.prepare(
+        'SELECT COUNT(*) as cnt FROM curve_snapshots WHERE mint = ?',
+      ).get(opts.mint) as { cnt: number } | null;
+
+      this.db.prepare(`
+        INSERT OR REPLACE INTO curve_outcomes (
+          mint, graduated, final_progress, final_sol, duration_s,
+          eviction_reason, snapshots_count, created_at, resolved_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        opts.mint,
+        opts.graduated ? 1 : 0,
+        opts.finalProgress,
+        opts.finalSol,
+        opts.durationS,
+        opts.evictionReason ?? null,
+        snapCount?.cnt ?? 0,
+        Date.now(),
+        Date.now(),
+      );
+
+      const emoji = opts.graduated ? '🎓' : '💀';
+      console.log(
+        `${emoji} [FeatureStore] Outcome: ${opts.mint.slice(0, 8)} | ` +
+        `graduated=${opts.graduated} | progress=${(opts.finalProgress * 100).toFixed(1)}% | ` +
+        `${opts.finalSol.toFixed(2)} SOL | ${opts.durationS.toFixed(0)}s | snapshots=${snapCount?.cnt ?? 0}`,
+      );
+    } catch (err) {
+      console.warn(`⚠️  [FeatureStore] labelCurveOutcome error: ${err}`);
+    }
+  }
+
+  /**
+   * Export curve snapshots joined with outcomes for ML training.
+   * Returns only mints that have a resolved outcome.
+   */
+  queryLabeledCurveData(limit = 50_000): Array<Record<string, unknown>> {
+    try {
+      return this.db.prepare(`
+        SELECT
+          s.mint, s.timestamp_ms, s.progress, s.real_sol_sol, s.price_sol,
+          s.market_cap_sol, s.tier, s.trade_count,
+          s.p_grad, s.confidence, s.breakeven, s.action,
+          s.sol_per_minute_1m, s.sol_per_minute_5m,
+          s.avg_trade_size_sol, s.velocity_ratio,
+          s.bot_transaction_ratio, s.smart_money_buyer_cnt,
+          s.creator_is_selling, s.fresh_wallet_ratio,
+          o.graduated, o.final_progress, o.final_sol, o.duration_s
+        FROM curve_snapshots s
+        INNER JOIN curve_outcomes o ON s.mint = o.mint
+        ORDER BY s.timestamp_ms DESC
+        LIMIT ?
+      `).all(limit) as Array<Record<string, unknown>>;
+    } catch (err) {
+      console.warn(`⚠️  [FeatureStore] queryLabeledCurveData error: ${err}`);
+      return [];
+    }
+  }
+
+  getCurveOutcomeCount(): { total: number; graduated: number; evicted: number } {
+    try {
+      const row = this.db.prepare(`
+        SELECT
+          COUNT(*) as total,
+          COALESCE(SUM(CASE WHEN graduated = 1 THEN 1 ELSE 0 END), 0) as graduated,
+          COALESCE(SUM(CASE WHEN graduated = 0 THEN 1 ELSE 0 END), 0) as evicted
+        FROM curve_outcomes
+      `).get() as { total: number; graduated: number; evicted: number } | null;
+      return row ?? { total: 0, graduated: 0, evicted: 0 };
+    } catch {
+      return { total: 0, graduated: 0, evicted: 0 };
     }
   }
 

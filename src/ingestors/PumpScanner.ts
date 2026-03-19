@@ -1,23 +1,26 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import { EventEmitter } from 'events';
 import { getMint } from '@solana/spl-token';
+import WS from 'ws';
 import type { MarketEvent, TokenMetadata } from '../types/index.js';
+import { getCurveTracker } from '../modules/curve-tracker/CurveTracker.js';
+import { KOTH_SOL_THRESHOLD } from '../constants/pumpfun.js';
+import { deriveBondingCurvePDA, decodeBondingCurve, type BondingCurveState } from '../types/bonding-curve.js';
+import { calcProgress } from '../math/curve-math.js';
 
 /**
  * PumpScanner - Surveillance temps réel des nouveaux tokens Pump.fun
  * 
- * Architecture High Performance (Free Tier Optimized):
- * - WebSocket natif via connection.onLogs (plus stable que gRPC gratuit)
- * - Commitment 'processed' pour latence minimale (< 50ms)
- * - Filtrage rapide sur logs ("Instruction: Create" / "InitializeMint")
- * - Extraction Mint depuis postTokenBalances (heuristique balance géante)
- * - Dédoublonnage intelligent avec Set<string>
- * 
- * Latence cible: < 100ms de la création à l'événement newLaunch
+ * Uses raw `ws` package for WebSocket subscriptions (Bun's native WebSocket
+ * fails the HTTP 101 upgrade with Solana RPC endpoints due to compression
+ * negotiation issues). The `@solana/web3.js` Connection is kept for RPC calls only.
  */
 
-// Pump.fun Program ID (mainnet-beta)
-const PUMPFUN_PROGRAM_ID = new PublicKey('6EF8rSdqWSwisY94eDD4MpzoQzeD9F8H5JyoC1q282J3');
+import { PUMP_PROGRAM_ID } from '../constants/pumpfun.js';
+
+const LAMPORTS_PER_SOL_N = 1_000_000_000;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * Événements émis par PumpScanner
@@ -41,100 +44,203 @@ export interface PumpScannerOptions {
 
 export class PumpScanner extends EventEmitter {
   private connection: Connection;
-  private wsConnection: Connection;
-  private subscriptionId: number | null = null;
+  private ws: WS | null = null;
+  private wsSubId: number | null = null;
   private processedSignatures: Set<string> = new Set();
   private isRunning: boolean = false;
   private fastCheckThreshold: number;
-  private readonly MAX_CACHE_SIZE = 1000; // Nettoie le Set si > 1000
+  private readonly MAX_CACHE_SIZE = 1000;
+
+  private readonly isCurveMode: boolean;
+  private readonly minRegistrationSOL: number;
+  private readonly maxGetTxRetries: number;
+
+  private registeredMints: Set<string> = new Set();
+  private readonly MAX_MINT_CACHE = 500;
+
+  private readonly rpcUrl: string;
+  private readonly wsEndpoints: string[];
+  private activeWsIndex = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly RECONNECT_DELAY_MS = 5_000;
+  private readonly HEALTH_CHECK_INTERVAL_MS = 15_000;
+  private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
+  private lastEventTs = 0;
+  private rpcIdCounter = 1;
+
+  private statsInternal = {
+    txNotFound: 0,
+    filteredLowSOL: 0,
+    filteredLateStage: 0,
+    registeredCurves: 0,
+    curveCheckFailed: 0,
+    duplicateMints: 0,
+    wsReconnects: 0,
+  };
 
   constructor(options: PumpScannerOptions = {}) {
     super();
 
-    const rpcUrl = options.rpcUrl || process.env.HELIUS_RPC_URL || process.env.RPC_URL;
-    const wsUrl = options.wsUrl || process.env.HELIUS_WS_URL || rpcUrl?.replace('https://', 'wss://');
+    this.isCurveMode = process.env.STRATEGY_MODE === 'curve-prediction';
+    this.minRegistrationSOL = parseFloat(process.env.MIN_CURVE_REGISTRATION_SOL || '1.5');
+    this.maxGetTxRetries = this.isCurveMode ? 2 : 0;
 
-    if (!rpcUrl) {
+    this.rpcUrl = options.rpcUrl || process.env.HELIUS_RPC_URL || process.env.RPC_URL || '';
+    const heliusWs = options.wsUrl || process.env.HELIUS_WS_URL || this.rpcUrl.replace('https://', 'wss://');
+    const publicWs = 'wss://api.mainnet-beta.solana.com';
+
+    this.wsEndpoints = [publicWs, heliusWs].filter(Boolean);
+
+    if (!this.rpcUrl) {
       throw new Error('RPC URL must be provided via options or HELIUS_RPC_URL env var');
     }
 
-    if (!wsUrl) {
-      throw new Error('WebSocket URL must be provided via options or HELIUS_WS_URL env var');
-    }
-
-    // Connection pour les requêtes RPC (getTransaction)
-    this.connection = new Connection(rpcUrl, {
+    this.connection = new Connection(this.rpcUrl, {
       commitment: 'confirmed',
       confirmTransactionInitialTimeout: 30000,
     });
 
-    // Connection WebSocket dédiée pour onLogs (commitment 'processed')
-    this.wsConnection = new Connection(wsUrl, {
-      commitment: 'processed', // Le plus rapide disponible
-      wsEndpoint: wsUrl,
-    });
-
-    this.fastCheckThreshold = options.fastCheckThreshold || 30; // 30 SOL par défaut pour Pump.fun
+    this.fastCheckThreshold = options.fastCheckThreshold || 30;
   }
 
-  /**
-   * Démarre la surveillance Pump.fun via WebSocket
-   */
   async start(): Promise<void> {
     if (this.isRunning) {
-      console.warn('[PumpScanner] ⚠️ Déjà en cours d\'exécution');
+      console.warn('[PumpScanner] ⚠️ Deja en cours d\'execution');
       return;
     }
 
-    try {
-      console.log('[PumpScanner] 🚀 Démarrage...');
-      console.log(`📊 Programme surveillé: ${PUMPFUN_PROGRAM_ID.toBase58()}`);
+    const commitment = this.isCurveMode ? 'confirmed' : 'processed';
+    console.log('[PumpScanner] 🚀 Demarrage...');
+    console.log(`📊 Programme surveille: ${PUMP_PROGRAM_ID.toBase58()}`);
+    console.log(`⚡ Mode: ${this.isCurveMode ? 'curve-prediction' : 'legacy'}`);
+    console.log(`⚡ Commitment: ${commitment}`);
+    console.log(`🌐 WS endpoints: ${this.wsEndpoints.length} (primary: ${this.wsEndpoints[0]?.slice(0, 40)}...)`);
+    if (this.isCurveMode) {
+      console.log(`🔍 Min registration SOL: ${this.minRegistrationSOL}`);
+    } else {
       console.log(`⚡ FastCheck threshold: ${this.fastCheckThreshold} SOL`);
-      console.log(`⚡ Commitment: processed (latence minimale)`);
+    }
 
-      // Souscription aux logs du programme Pump.fun avec commitment 'processed'
-      this.subscriptionId = this.wsConnection.onLogs(
-        PUMPFUN_PROGRAM_ID,
-        async (logs, context) => {
-          // Gestion d'erreurs silencieuse pour ne pas crasher la boucle
-          try {
-            await this.handleLogs(logs, context);
-          } catch (error) {
-            // Erreur silencieuse (log uniquement en debug)
-            // Ne pas émettre d'erreur pour éviter de spammer
+    this.isRunning = true;
+    this.lastEventTs = Date.now();
+    this.connectWs();
+
+    this.healthCheckTimer = setInterval(() => this.checkHealth(), this.HEALTH_CHECK_INTERVAL_MS);
+  }
+
+  private connectWs(): void {
+    const wsUrl = this.wsEndpoints[this.activeWsIndex] ?? this.wsEndpoints[0]!;
+
+    try {
+      if (this.ws) {
+        try { this.ws.terminate(); } catch {}
+        this.ws = null;
+      }
+
+      this.ws = new WS(wsUrl, { perMessageDeflate: false, handshakeTimeout: 10_000 });
+
+      this.ws.on('open', () => {
+        console.log(`[PumpScanner] ✅ WS connected: ${wsUrl.slice(0, 50)}`);
+        const commitment = this.isCurveMode ? 'confirmed' : 'processed';
+        const subId = this.rpcIdCounter++;
+        this.ws!.send(JSON.stringify({
+          jsonrpc: '2.0',
+          id: subId,
+          method: 'logsSubscribe',
+          params: [
+            { mentions: [PUMP_PROGRAM_ID.toBase58()] },
+            { commitment },
+          ],
+        }));
+        this.lastEventTs = Date.now();
+        this.emit('connected');
+      });
+
+      this.ws.on('message', (raw: WS.RawData) => {
+        try {
+          this.lastEventTs = Date.now();
+          const msg = JSON.parse(raw.toString());
+
+          if (msg.result !== undefined && !msg.method) {
+            this.wsSubId = msg.result;
+            return;
           }
-        },
-        'processed' // Commitment le plus rapide
-      );
 
-      this.isRunning = true;
-      this.emit('connected');
-      console.log('[PumpScanner] ✅ Connecté et en écoute\n');
-    } catch (error) {
-      console.error('[PumpScanner] ❌ Erreur lors du démarrage:', error);
-      this.emit('error', error as Error);
-      this.isRunning = false;
-      throw error;
+          if (msg.method === 'logsNotification') {
+            const result = msg.params?.result;
+            const value = result?.value;
+            if (!value) return;
+            const logs = {
+              signature: value.signature as string,
+              err: value.err,
+              logs: value.logs as string[],
+            };
+            const context = { slot: result?.context?.slot ?? 0 };
+            this.handleLogs(logs, context).catch(() => {});
+          }
+        } catch {}
+      });
+
+      this.ws.on('close', () => {
+        console.warn(`⚠️  [PumpScanner] WS closed — scheduling reconnect`);
+        this.scheduleReconnect();
+      });
+
+      this.ws.on('error', (err: Error) => {
+        console.warn(`⚠️  [PumpScanner] WS error: ${err.message?.slice(0, 80)}`);
+      });
+    } catch (err) {
+      console.error(`❌ [PumpScanner] WS connect failed:`, err);
+      this.scheduleReconnect();
     }
   }
 
-  /**
-   * Arrête la surveillance
-   */
+  private checkHealth(): void {
+    if (!this.isRunning) return;
+    const silenceSec = (Date.now() - this.lastEventTs) / 1_000;
+    if (silenceSec > 60) {
+      console.warn(`⚠️  [PumpScanner] No WS events for ${silenceSec.toFixed(0)}s — reconnecting...`);
+      this.scheduleReconnect();
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer || !this.isRunning) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!this.isRunning) return;
+
+      this.activeWsIndex = (this.activeWsIndex + 1) % this.wsEndpoints.length;
+      this.statsInternal.wsReconnects++;
+      console.log(`🔄 [PumpScanner] Reconnecting to WS #${this.activeWsIndex} (${this.wsEndpoints[this.activeWsIndex]?.slice(0, 40)}...)`);
+      this.connectWs();
+    }, this.RECONNECT_DELAY_MS);
+  }
+
   async stop(): Promise<void> {
     if (!this.isRunning) {
       return;
     }
 
-    console.log('[PumpScanner] 🛑 Arrêt en cours...');
+    console.log('[PumpScanner] 🛑 Arret en cours...');
+    this.isRunning = false;
 
-    if (this.subscriptionId !== null) {
-      try {
-        await this.wsConnection.removeOnLogsListener(this.subscriptionId);
-        this.subscriptionId = null;
-      } catch (error) {
-        // Erreur silencieuse lors de la déconnexion
+    if (this.healthCheckTimer) { clearInterval(this.healthCheckTimer); this.healthCheckTimer = null; }
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+
+    if (this.ws) {
+      if (this.wsSubId !== null) {
+        try {
+          this.ws.send(JSON.stringify({
+            jsonrpc: '2.0',
+            id: this.rpcIdCounter++,
+            method: 'logsUnsubscribe',
+            params: [this.wsSubId],
+          }));
+        } catch {}
       }
+      try { this.ws.terminate(); } catch {}
+      this.ws = null;
     }
 
     this.isRunning = false;
@@ -179,16 +285,15 @@ export class PumpScanner extends EventEmitter {
     // Marque comme en cours de traitement
     this.processedSignatures.add(signature);
 
-    // Filtre rapide sur les logs : recherche "Instruction: Create" ou "InitializeMint"
-    const logString = logs.logs?.join(' ') || '';
-    
-    const hasCreateInstruction = 
-      logString.includes('Instruction: Create') || 
-      logString.includes('InitializeMint') ||
-      logString.includes('Create');
+    const logLines: string[] = logs.logs ?? [];
+    const hasCreateInstruction = logLines.some(
+      (line: string) =>
+        line.includes('Instruction: Create') ||
+        line.includes('InitializeMint2'),
+    );
 
     if (!hasCreateInstruction) {
-      return; // Pas une création de token
+      return;
     }
 
     // Lance l'extraction du Mint depuis la transaction
@@ -198,71 +303,168 @@ export class PumpScanner extends EventEmitter {
     });
   }
 
-  /**
-   * Traite une transaction pour extraire le Mint du nouveau token
-   * 
-   * Heuristique :
-   * - Récupère la transaction avec getTransaction (version 0)
-   * - Analyse postTokenBalances pour trouver le Mint avec balance géante
-   * - Crée un MarketEvent et émet newLaunch + fastCheck
-   * 
-   * @param signature - Signature de la transaction
-   * @param t_recv - Timestamp de réception locale
-   */
   private async processTransaction(signature: string, t_recv: number): Promise<void> {
     try {
-      // Récupère la transaction avec maxSupportedTransactionVersion: 0
-      const tx = await this.connection.getTransaction(signature, {
-        maxSupportedTransactionVersion: 0,
-        commitment: 'confirmed', // 'confirmed' pour avoir les postTokenBalances
-      });
+      const tx = await this.getTransactionWithRetry(signature);
 
       if (!tx || !tx.transaction || !tx.meta) {
-        return; // Transaction invalide ou échouée
+        return;
       }
 
-      // Extraction du Mint depuis postTokenBalances
       const mint = this.extractMintFromTransaction(tx);
-
-      if (!mint) {
-        return; // Mint non trouvé
-      }
-
-      // Récupère les métadonnées du token
-      const tokenMetadata = await this.getTokenMetadata(new PublicKey(mint));
-
-      // Calcule la liquidité initiale (Pump.fun standard: ~30 SOL)
-      const liquiditySol = this.calculateInitialLiquidity(tx);
+      if (!mint) return;
 
       const t_source: number = tx?.blockTime ? tx.blockTime * 1000 : t_recv;
 
-      // Crée l'événement MarketEvent
-      const marketEvent: MarketEvent = {
-        token: tokenMetadata,
-        poolId: `pump-${signature.slice(0, 8)}`, // ID unique basé sur signature
-        initialLiquiditySol: liquiditySol,
-        initialPriceUsdc: 0, // Prix initial Pump.fun très faible
-        timestamp: t_source,
-        t_source,
-        t_recv,
-      };
-
-      console.log(`[PumpScanner] 🆕 NewLaunch détecté!`);
-      console.log(`   Mint: ${mint}`);
-      console.log(`   Liquidité: ${liquiditySol.toFixed(2)} SOL`);
-
-      // Émet l'événement newLaunch
-      this.emit('newLaunch', marketEvent);
-
-      // Émet fastCheck si liquidité suffisante (Pump.fun = toujours FastCheck)
-      if (liquiditySol >= this.fastCheckThreshold) {
-        console.log(`[PumpScanner] ⚡ FastCheck activé! (${liquiditySol.toFixed(2)} SOL)`);
-        this.emit('fastCheck', marketEvent);
+      if (this.isCurveMode) {
+        await this.processCurveMode(mint, tx, signature, t_source, t_recv);
+      } else {
+        await this.processLegacyMode(mint, tx, signature, t_source, t_recv);
       }
-    } catch (error) {
-      // Gestion d'erreurs silencieuse (ne pas spammer les logs)
-      // Les erreurs RPC sont fréquentes (rate limits, timeout, etc.)
-      // On ignore silencieusement pour ne pas crasher la boucle d'événements
+    } catch {
+      // silent — RPC errors are frequent
+    }
+  }
+
+  /**
+   * getTransaction with configurable retry + delay for curve-prediction mode.
+   * In legacy mode: single attempt, no delay. In curve mode: up to maxGetTxRetries.
+   */
+  private async getTransactionWithRetry(signature: string): Promise<any> {
+    for (let attempt = 0; attempt <= this.maxGetTxRetries; attempt++) {
+      const tx = await this.connection.getTransaction(signature, {
+        maxSupportedTransactionVersion: 0,
+        commitment: 'confirmed',
+      });
+
+      if (tx?.transaction && tx.meta) return tx;
+
+      if (attempt < this.maxGetTxRetries) {
+        await sleep(1500);
+      } else {
+        this.statsInternal.txNotFound++;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * curve-prediction pipeline: fetch bonding curve state on-chain,
+   * filter tokens with insufficient SOL, only then register in CurveTracker.
+   */
+  private async processCurveMode(
+    mint: string,
+    tx: any,
+    signature: string,
+    t_source: number,
+    t_recv: number,
+  ): Promise<void> {
+    if (this.registeredMints.has(mint)) {
+      this.statsInternal.duplicateMints++;
+      return;
+    }
+
+    const mintPk = new PublicKey(mint);
+    const [curvePDA] = deriveBondingCurvePDA(mintPk);
+
+    let realSolSOL = 0;
+    let progress = 0;
+    let curveComplete = false;
+    let decodedState: BondingCurveState | undefined;
+
+    try {
+      const acctInfo = await this.connection.getAccountInfo(curvePDA);
+      if (acctInfo?.data) {
+        decodedState = decodeBondingCurve(acctInfo.data as Buffer);
+        realSolSOL = Number(decodedState.realSolReserves) / LAMPORTS_PER_SOL_N;
+        progress = calcProgress(decodedState.realTokenReserves);
+        curveComplete = decodedState.complete;
+      }
+    } catch {
+      this.statsInternal.curveCheckFailed++;
+    }
+
+    if (curveComplete) return;
+    if (realSolSOL < this.minRegistrationSOL) {
+      this.statsInternal.filteredLowSOL++;
+      return;
+    }
+    if (progress > 0.80) {
+      this.statsInternal.filteredLateStage++;
+      return;
+    }
+
+    const tokenMetadata = { mint, symbol: 'PUMP', name: 'Pump Token', decimals: 6 };
+    const creatorAddress = this.extractCreatorFromTransaction(tx);
+
+    if (this.registeredMints.size >= this.MAX_MINT_CACHE) {
+      const oldest = Array.from(this.registeredMints).slice(0, 250);
+      oldest.forEach((m) => this.registeredMints.delete(m));
+    }
+    this.registeredMints.add(mint);
+
+    const curveTracker = getCurveTracker();
+    curveTracker.registerNewCurve(
+      mint,
+      creatorAddress,
+      { name: tokenMetadata.name, symbol: tokenMetadata.symbol },
+      decodedState,
+    );
+    this.statsInternal.registeredCurves++;
+
+    console.log(
+      `[PumpScanner] 🆕 Curve enregistrée: ${mint.slice(0, 8)}... | ` +
+      `${realSolSOL.toFixed(2)} SOL | progress ${(progress * 100).toFixed(1)}%`,
+    );
+
+    const marketEvent: MarketEvent = {
+      token: tokenMetadata,
+      poolId: `pump-${signature.slice(0, 8)}`,
+      initialLiquiditySol: realSolSOL,
+      initialPriceUsdc: 0,
+      timestamp: t_source,
+      t_source,
+      t_recv,
+    };
+    this.emit('newLaunch', marketEvent);
+
+    if (realSolSOL >= KOTH_SOL_THRESHOLD) {
+      curveTracker.forcePromoteHot(mint);
+    }
+  }
+
+  /**
+   * Legacy snipe-at-T=0 pipeline: no bonding curve check, max speed.
+   */
+  private async processLegacyMode(
+    mint: string,
+    tx: any,
+    signature: string,
+    t_source: number,
+    t_recv: number,
+  ): Promise<void> {
+    const tokenMetadata = await this.getTokenMetadata(new PublicKey(mint));
+    const liquiditySol = this.calculateInitialLiquidity(tx);
+
+    const marketEvent: MarketEvent = {
+      token: tokenMetadata,
+      poolId: `pump-${signature.slice(0, 8)}`,
+      initialLiquiditySol: liquiditySol,
+      initialPriceUsdc: 0,
+      timestamp: t_source,
+      t_source,
+      t_recv,
+    };
+
+    console.log(`🆕 Nouveau token détecté!`);
+    console.log(`   Mint: ${mint}`);
+    console.log(`   Liquidité: ${liquiditySol.toFixed(2)} SOL`);
+
+    this.emit('newLaunch', marketEvent);
+
+    if (liquiditySol >= this.fastCheckThreshold) {
+      console.log(`⚡ FastCheck activé! (${liquiditySol.toFixed(2)} SOL)`);
+      this.emit('fastCheck', marketEvent);
     }
   }
 
@@ -386,17 +588,48 @@ export class PumpScanner extends EventEmitter {
   }
 
   /**
-   * Statistiques pour monitoring
+   * Extrait l'adresse du createur depuis la transaction Pump.fun.
+   * Heuristique: le premier signer (fee payer) est generalement le createur.
    */
+  private extractCreatorFromTransaction(tx: any): string {
+    try {
+      const keys = tx?.transaction?.message?.accountKeys;
+      if (Array.isArray(keys) && keys.length > 0) {
+        const first = keys[0];
+        if (typeof first === 'string') return first;
+        if (first?.pubkey) return first.pubkey.toBase58?.() ?? String(first.pubkey);
+        return String(first);
+      }
+      const staticKeys = tx?.transaction?.message?.staticAccountKeys;
+      if (Array.isArray(staticKeys) && staticKeys.length > 0) {
+        return staticKeys[0].toBase58?.() ?? String(staticKeys[0]);
+      }
+    } catch { /* silent */ }
+    return PublicKey.default.toBase58();
+  }
+
   getStats(): {
     isRunning: boolean;
     processedCount: number;
     cacheSize: number;
+    txNotFound: number;
+    filteredLowSOL: number;
+    filteredLateStage: number;
+    registeredCurves: number;
+    curveCheckFailed: number;
+    wsReconnects: number;
+    mode: string;
+    minRegistrationSOL: number;
+    activeWsEndpoint: string;
   } {
     return {
       isRunning: this.isRunning,
       processedCount: this.processedSignatures.size,
       cacheSize: this.processedSignatures.size,
+      ...this.statsInternal,
+      mode: this.isCurveMode ? 'curve-prediction' : 'legacy',
+      minRegistrationSOL: this.minRegistrationSOL,
+      activeWsEndpoint: this.wsEndpoints[this.activeWsIndex]?.slice(0, 40) ?? 'none',
     };
   }
 }

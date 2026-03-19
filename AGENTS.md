@@ -1,21 +1,30 @@
 ## Learned User Preferences
 - Treat the assistant as the Lead Engineer for the APEX-2026 HFT Solana bot, prioritizing ultra-low latency and capital preservation.
 - Prefer Bun as the only runtime (no Node.js, npm, yarn, or npx) with strict ESNext TypeScript and no implicit any.
-- Always favor parallel, non-blocking flows (Promise.all / Promise.allSettled / Promise.any) and RPC racing across multiple Solana endpoints.
+- Always favor parallel, non-blocking flows: Promise.allSettled for independent checks (never Promise.all when individual failures are acceptable), Promise.any for RPC racing across multiple Solana endpoints.
 - Require on-chain safety checks to go through Guard.ts, keeping public interfaces and shared types (like SecurityReport and validateToken) stable across refactors.
 - Expect detailed, emoji-rich logs with execution time in milliseconds for critical paths (Guard, scanners, Sniper, DecisionCore).
 - Prefer backward-compatible, additive changes (optional fields, preserved signatures) over breaking API changes, especially for core engine types and methods.
 - Use structured timing (t_source, t_recv, t_act) and latency metrics as first-class features for monitoring and ML feature engineering.
 - Rely on Jupiter APIs (quote/swap/Ultra) and Jito bundles for execution, but keep all HTTP calls on Bun fetch with explicit timeouts and graceful error handling.
 - Default trading mode to paper trading with conservative risk parameters unless the user explicitly switches to live trading.
+- Every external call (RPC, Jupiter, HTTP) must have an explicit timeout — never allow a call to block indefinitely.
+- When fixing a specific issue, apply targeted minimal changes ("ne touche a rien d'autre") — do not modify surrounding code.
+- All stateful services (FeatureStore, scanners, trackers) must flush and close gracefully on SIGINT shutdown.
 
 ## Learned Workspace Facts
 - The project APEX-2026 is a Solana HFT bot structured around MarketScanner, PumpScanner, Guard, DecisionCore, and Sniper executors.
-- Guard.ts centralizes all token safety checks, including parallelized risk analysis, RPC racing, top-10 holder concentration, honeypot detection via Jupiter, and Raydium liquidity and LP-burn estimates.
-- MarketScanner and PumpScanner emit MarketEvent objects enriched with triple timestamps (t_source, t_recv, t_act) that DecisionCore uses to compute detailed DecisionLatency metrics.
-- DecisionCore combines Guard security results, liquidity, and optional social signals into a final score and priority, then emits tokenScored and readyToSnipe events without changing the external MarketEvent or ScoredToken contracts.
-- Sniper.ts now uses Jupiter Ultra Swap API (/ultra/v1/order and /ultra/v1/execute) plus Jito bundles, explicit compute budget tuning, and congestion-aware Jito tips instead of older quote/swap flows.
+- Guard.ts centralizes all token safety checks via Promise.allSettled with individual timing, RPC racing, top-10 holder concentration (getTokenLargestAccounts), honeypot detection via Jupiter with timeout, Raydium liquidity and LP-burn estimates with timeout.
+- MarketScanner and PumpScanner emit MarketEvent objects (including RaydiumPoolKeys for 0-RPC execution) enriched with triple timestamps (t_source, t_recv, t_act) that DecisionCore uses to compute detailed DecisionLatency metrics.
+- DecisionCore uses AIBrain.decide() (replacing linear scoring) to combine HMM regime, Hawkes intensity, NLP sentiment, smart money signal, and Guard security into final BUY/SKIP decisions with Kelly-sized positions.
+- Sniper.ts uses Jupiter Ultra Swap API (/ultra/v1/order and /ultra/v1/execute) plus Jito bundles, explicit compute budget injection via TransactionMessage.decompile/recompile, and congestion-aware Jito tips.
 - Environment configuration expects unified Solana RPC variables (HELIUS_RPC_URL, HELIUS_WS_URL, QUICKNODE_RPC_URL, RPC_URL) and trading parameters (TRADING_MODE, SLIPPAGE_BPS, MIN_LIQUIDITY, MAX_RISK_SCORE, paper trading amounts).
+- StateManager (src/engine/StateManager.ts) pre-caches the latest Solana blockhash in RAM every 400ms for 0ms transaction building.
+- MarketScanner filters Token-2022 and known system program IDs (ComputeBudget, SystemProgram, JUP) before emitting events into the pipeline.
+- Both scanners implement WebSocket auto-reconnect with exponential backoff (max 10 attempts) and silent Geyser-to-WebSocket fallback for Helius free tier.
+- V3 uses a 3-layer polyglot architecture: Rust cdylib for hot path inference (<10ms), TypeScript/Bun for orchestration, Python for cold path ML training, connected via bun:ffi with BufferPool for GC mitigation.
+- FeatureStore (bun:sqlite) is append-only on the cold path with in-memory buffer flush every 5s, storing feature snapshots, token outcomes, and model params for ML training.
+- Cursor rules use .cursor/rules/ MDC format organized by domain (global, typescript, solana, database, ml) instead of legacy .cursorrules.
 
 ## V3 Roadmap — Architecture & Key Decisions
 - V3 target architecture: 3-layer polyglot — Rust .so (hot path inference < 10ms), TypeScript/Bun (orchestration), Python (cold path training/retraining).
@@ -48,3 +57,51 @@
 - src/perps/ — DriftConnector.ts, MarginMonitor.ts, LiquidationGuard.ts
 - src/connectors/ — AssetConnector.ts, SolanaConnector.ts, AlpacaConnector.ts
 - python/ — models/ (TFT), training/ (HMM, Hawkes), rl/ (Gym env, PPO, shadow_eval), retrain_pipeline.py, model_registry.py
+
+## V3 Implementation Status (24/37 tickets done — 65%)
+- DONE: P1.1 FFI Bridge (Rust DLL 110KB, 100ns p50), P1.4 Feature Store, P2.1 NLP Pipeline, P2.1.2 ViralityScorer, P2.2.2 SmartMoneyTracker(TS), P2.3.1 OFI(TS), P2.4.1 FeatureAssembler, P3.1/P3.2 HMM+Hawkes(TS fallback), P3.4.1 AIBrain(0.5ms), P4.1.1 Kelly, P4.1.2 CVaR, P4.4.1 RewardLogger, P5.1-5.3 RL pipeline
+- MISSING (data-blocked): P3.1.2/P3.2.2 Python trainers, P3.3 TFT, P1.3 ONNX Rust — need 5000+ Feature Store samples
+- MISSING (optional): P1.2 gRPC (payant), P2.2.1 Louvain Rust, P5.4 Asset connectors
+- MISSING (execution upgrades): P4.2 SniperV3+BAM, P4.3 Drift Protocol
+- AIBrain integrated into DecisionCore (replaces linear scoring), ShadowAgent runs parallel, ModelUpdater watches models/ dir
+
+## V3.1 Roadmap — Bonding Curve Prediction Strategy (roadmapv2.md)
+- Reference: Marino et al. (arXiv:2602.14860) — "Predicting the success of new crypto-tokens"
+- Strategy: Predictive positioning on Pump.fun bonding curves. Instead of sniping at T=0 (high risk), monitor curve progression and enter when P(graduation) > breakeven threshold.
+- Bonding curve is a constant-product AMM: virtualSol × virtualToken = k. Graduation at ~85 SOL real reserves. Fee = 1.25% (125 bps).
+- KOTH (King of the Hill) at ~32 SOL. Sweet spot entry zone: 35-55 SOL (~55-75% progress).
+- Tiered monitoring: Cold (<25%, poll 60s) → Warm (25-50%, poll 10s) → Hot (>50%, poll 3s). Max 5000 cold, 500 warm, 100 hot curves.
+- Graduation predictor: 2-stage system. Stage 1: fast heuristic vetos (<1ms). Stage 2: weighted score (velocity 40%, bot detection 20%, smart money 15%, holder diversity 15%, social 10%) → pGrad.
+- Entry condition: pGrad > breakeven × 1.2 (20% safety margin). Breakeven at 50% ≈ 51%, at 75% ≈ 78%.
+- Execution: Direct Pump.fun program interaction (NOT Jupiter). BUY discriminator [102,6,61,18,1,218,235,234], SELL [51,230,133,164,1,127,131,173]. 15 accounts for buy instruction. Jito bundles for inclusion.
+- Risk: StallDetector (velocity drop), PortfolioGuard (max 5 concurrent, 20% exposure cap, 5% daily loss limit), GraduationExitStrategy, max hold 2h.
+- Kelly sizing based on P(graduation) instead of linear score.
+- Dual mode via STRATEGY_MODE env var: 'curve-prediction' (new) vs legacy snipe-at-T=0.
+
+## V3.1 Bonding Curve — Sprint Plan (4 sprints, 8 weeks)
+- Sprint 1 (S1-S2): Foundation — pumpfun.ts constants, bonding-curve.ts types+decoder, curve-math.ts (8 math functions, all bigint), test-curve-decode.ts validation, BatchPoller (getMultipleAccounts batches of 100, RPC racing), TieredMonitor (cold/warm/hot lifecycle), CurveTracker orchestrator, PumpScanner modification (registerNewCurve instead of immediate snipe).
+- Sprint 2 (S3-S4): Signals — VelocityAnalyzer (SOL/min, acceleration, peak ratio), BotDetector (fresh wallets, uniform trades, same-block buys), WalletScorer (smart money count, creator history, creator selling = RED FLAG), HolderDistribution (HHI, Gini), BreakevenCurve (min P(grad) for profitability), FeatureAssembler extension (30+ curve features), FeatureStore schema extension.
+- Sprint 3 (S5-S6): Prediction+Execution — GraduationPredictor (heuristic + future ML), CurveExecutor (direct Pump.fun instructions), JitoBundler for curves, AIBrain modification (ENTER_CURVE/EXIT_CURVE/HOLD/SKIP), DecisionCore modification (curve-prediction routing), Guard curve-specific checks.
+- Sprint 4 (S7-S8): Risk+Live — StallDetector, PortfolioGuard, GraduationExitStrategy, KellyEngine modification (P(grad)-based), app.ts integration.
+
+## V3.1 Key Constants (Pump.fun on-chain)
+- PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+- PUMPSWAP_PROGRAM_ID = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+- INITIAL_VIRTUAL_TOKEN_RESERVES = 1_073_000_000_000_000n (1.073B, 6 decimals)
+- INITIAL_VIRTUAL_SOL_RESERVES = 30_000_000_000n (30 SOL)
+- INITIAL_REAL_TOKEN_RESERVES = 793_100_000_000_000n (793.1M tradeable)
+- TOKEN_TOTAL_SUPPLY = 1_000_000_000_000_000n (1B total)
+- GRADUATION_REAL_SOL_THRESHOLD = 85_000_000_000n (~85 SOL)
+- FEE_BASIS_POINTS = 125n (1.25%)
+- BONDING_CURVE_ACCOUNT_SIZE = 82 bytes (+ 8 discriminator = 90 total)
+- BondingCurveState layout: vTokenReserves(u64@0x00), vSolReserves(u64@0x08), rTokenReserves(u64@0x10), rSolReserves(u64@0x18), totalSupply(u64@0x20), complete(u8@0x28), creator(Pubkey@0x29), isMayhemMode(u8@0x49)
+
+## V3.1 New File Paths
+- src/constants/pumpfun.ts — All Pump.fun program IDs, accounts, discriminators, thresholds
+- src/types/bonding-curve.ts — BondingCurveState, TrackedCurve, CurveTradeEvent, GraduationEvent, decodeBondingCurve(), deriveBondingCurvePDA()
+- src/math/curve-math.ts — calcProgress, calcPricePerToken, calcMarketCapSOL, calcBuyOutput, calcSellOutput, calcRequiredSolForProgress, calcPriceImpact, calcExpectedReturnOnGraduation
+- src/modules/curve-tracker/ — CurveTracker.ts, TieredMonitor.ts, BatchPoller.ts
+- src/modules/graduation-predictor/ — GraduationPredictor.ts, VelocityAnalyzer.ts, BotDetector.ts, WalletScorer.ts, HolderDistribution.ts, BreakevenCurve.ts
+- src/modules/curve-executor/ — CurveExecutor.ts, JitoBundler.ts, GraduationExitStrategy.ts
+- src/modules/risk/ — StallDetector.ts, PortfolioGuard.ts
+- scripts/test-curve-decode.ts — Live validation script

@@ -4,7 +4,7 @@ import { Guard } from '../detectors/Guard.js';
 import { SocialPulse } from '../ingestors/SocialPulse.js';
 import { getFeatureStore } from '../data/FeatureStore.js';
 import { getOutcomeTracker } from './OutcomeTracker.js';
-import { getAIBrain, type AIDecision } from './AIBrain.js';
+import { getAIBrain, type AIDecision, type CurveDecision } from './AIBrain.js';
 import { getFeatureAssembler } from '../features/FeatureAssembler.js';
 import { getShadowAgent } from './ShadowAgent.js';
 import type {
@@ -14,7 +14,9 @@ import type {
   SocialSignal,
   DecisionLatency,
   FeatureSnapshotRecord,
+  CurveSnapshotRecord,
 } from '../types/index.js';
+import type { TrackedCurve, CurveTradeEvent } from '../types/bonding-curve.js';
 
 /**
  * Événements émis par le DecisionCore
@@ -44,7 +46,7 @@ export interface DecisionCoreOptions {
  * calcule un score final et décide d'exécuter ou non le trade.
  */
 export class DecisionCore extends EventEmitter {
-  private scanner: MarketScanner;
+  private scanner: MarketScanner | null;
   private guard: Guard;
   private socialPulse: SocialPulse | null;
   private minLiquidity: number;
@@ -53,6 +55,13 @@ export class DecisionCore extends EventEmitter {
   private tokensProcessed: number = 0;
   private tokensAccepted: number = 0;
   private tokensRejected: number = 0;
+  private curvesEvaluated: number = 0;
+  private curvesEntered: number = 0;
+  private curvesSkippedCooldown: number = 0;
+  private activeCurvePositions: number = 0;
+  private readonly curveCooldowns: Map<string, number> = new Map();
+  private readonly curveLoggedEnter: Set<string> = new Set();
+  private readonly CURVE_COOLDOWN_MS = 30_000;
 
   constructor(options: DecisionCoreOptions = {}) {
     super();
@@ -62,42 +71,46 @@ export class DecisionCore extends EventEmitter {
     this.enableFastCheck = options.enableFastCheck !== false;
     this.socialPulse = options.socialPulse || null;
 
-    // Initialise les composants
-    this.scanner = new MarketScanner({
-      fastCheckThreshold: options.fastCheckThreshold || 100,
-    });
+    const isCurveMode = process.env.STRATEGY_MODE === 'curve-prediction';
+
+    if (!isCurveMode) {
+      this.scanner = new MarketScanner({
+        fastCheckThreshold: options.fastCheckThreshold || 100,
+      });
+      this.setupScannerEvents();
+    } else {
+      this.scanner = null;
+      console.log('⚠️ [DecisionCore] MarketScanner disabled (curve-prediction mode — saves RPC quota)');
+    }
 
     this.guard = new Guard();
-
-    // Configure les événements du scanner
-    this.setupScannerEvents();
   }
 
   /**
    * Configure les événements du MarketScanner
    */
   private setupScannerEvents(): void {
-    // Événement standard : nouveau token détecté
-    this.scanner.on('newToken', async (event: MarketEvent) => {
+    if (!this.scanner) return;
+    const scanner = this.scanner;
+
+    scanner.on('newToken', async (event: MarketEvent) => {
       this.emit('tokenDetected', event.token.mint);
       await this.processToken(event, false);
     });
 
-    // FastCheck : priorité absolue pour haute liquidité
     if (this.enableFastCheck) {
-      this.scanner.on('fastCheck', async (event: MarketEvent) => {
+      scanner.on('fastCheck', async (event: MarketEvent) => {
         this.emit('tokenDetected', event.token.mint);
         console.log('⚡ FastCheck déclenché pour:', event.token.mint);
         await this.processToken(event, true);
       });
     }
 
-    // Propagation des événements de connexion
-    this.scanner.on('connected', () => {
+    scanner.on('connected', () => {
       console.log('✅ DecisionCore: Scanner connecté');
     });
 
-    this.scanner.on('error', (error: Error) => {
+    scanner.on('error', (error: Error) => {
       console.error('❌ DecisionCore: Erreur scanner:', error);
     });
   }
@@ -111,7 +124,9 @@ export class DecisionCore extends EventEmitter {
     console.log(`   - Risk score max: ${this.maxRiskScore}`);
     console.log(`   - FastCheck: ${this.enableFastCheck ? 'Activé' : 'Désactivé'}\n`);
 
-    await this.scanner.start();
+    if (this.scanner) {
+      await this.scanner.start();
+    }
   }
 
   /**
@@ -119,7 +134,9 @@ export class DecisionCore extends EventEmitter {
    */
   async stop(): Promise<void> {
     console.log('🛑 Arrêt du DecisionCore...');
-    await this.scanner.stop();
+    if (this.scanner) {
+      await this.scanner.stop();
+    }
     
     console.log('\n📊 Statistiques finales:');
     console.log(`   - Tokens traités: ${this.tokensProcessed}`);
@@ -135,6 +152,101 @@ export class DecisionCore extends EventEmitter {
    */
   async processMarketEvent(event: MarketEvent, isFastCheck: boolean = false): Promise<void> {
     await this.processToken(event, isFastCheck);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V3.1 Curve-Prediction Pipeline
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Process a curve that entered the HOT zone.
+   * Pipeline: Guard.validateCurve() → AIBrain.decideCurve() → emit readyCurveBuy / log
+   */
+  async processCurveEvent(
+    curve: TrackedCurve,
+    trades: CurveTradeEvent[],
+  ): Promise<CurveDecision | null> {
+    const now = Date.now();
+    const lastEval = this.curveCooldowns.get(curve.mint);
+    if (lastEval && now - lastEval < this.CURVE_COOLDOWN_MS) {
+      this.curvesSkippedCooldown++;
+      return null;
+    }
+    this.curveCooldowns.set(curve.mint, now);
+
+    this.curvesEvaluated++;
+    const t0 = performance.now();
+
+    try {
+      const guardResult = this.guard.validateCurve(curve, this.activeCurvePositions);
+      if (!guardResult.allowed) {
+        if (!this.curveLoggedEnter.has(curve.mint)) {
+          console.log(
+            `❌ [DecisionCore:Curve] ${curve.mint.slice(0, 8)} blocked by Guard: ${guardResult.flags.join(', ')}`,
+          );
+        }
+        return null;
+      }
+
+      const brain = getAIBrain();
+      const decision = brain.decideCurve(curve, trades);
+
+      try {
+        const snap: CurveSnapshotRecord = {
+          id: crypto.randomUUID(),
+          mint: curve.mint,
+          timestampMs: now,
+          progress: curve.progress,
+          realSolSOL: curve.realSolSOL,
+          priceSOL: curve.priceSOL,
+          marketCapSOL: curve.marketCapSOL,
+          tier: curve.tier,
+          tradeCount: curve.tradeCount,
+          pGrad: decision.pGrad,
+          confidence: decision.confidence,
+          breakeven: decision.breakeven,
+          action: decision.action,
+          vetoReason: decision.prediction.vetoReason,
+          solPerMinute1m: decision.prediction.velocity.solPerMinute_1m,
+          solPerMinute5m: decision.prediction.velocity.solPerMinute_5m,
+          avgTradeSizeSOL: decision.prediction.velocity.avgTradeSize_SOL,
+          velocityRatio: decision.prediction.velocity.velocityRatio,
+          botTransactionRatio: decision.prediction.botSignal.botTransactionRatio,
+          smartMoneyBuyerCount: decision.prediction.walletScore.smartMoneyBuyerCount,
+          creatorIsSelling: decision.prediction.walletScore.creatorIsSelling ? 1 : 0,
+          freshWalletRatio: decision.prediction.walletScore.freshWalletRatio,
+          predictionMs: decision.latencyMs,
+          createdAt: now,
+        };
+        getFeatureStore().appendCurveSnapshot(snap);
+      } catch {
+        // cold path silencieux
+      }
+
+      if (decision.action === 'ENTER_CURVE') {
+        this.curvesEntered++;
+        const isFirstEnter = !this.curveLoggedEnter.has(curve.mint);
+        if (isFirstEnter) {
+          this.curveLoggedEnter.add(curve.mint);
+          console.log(
+            `✅ [DecisionCore:Curve] ENTER ${curve.mint.slice(0, 8)} | ` +
+            `pGrad=${(decision.pGrad * 100).toFixed(1)}% | pos=${decision.positionSol.toFixed(3)} SOL | ` +
+            `${(performance.now() - t0).toFixed(1)}ms`,
+          );
+        }
+        this.emit('readyCurveBuy', curve, decision);
+      }
+
+      return decision;
+    } catch (err) {
+      console.error(`❌ [DecisionCore:Curve] Error processing ${curve.mint.slice(0, 8)}:`, err);
+      return null;
+    }
+  }
+
+  /** Called by app.ts when a curve position is opened/closed. */
+  updateActivePositions(delta: number): void {
+    this.activeCurvePositions = Math.max(0, this.activeCurvePositions + delta);
   }
 
   /**
@@ -412,11 +524,20 @@ export class DecisionCore extends EventEmitter {
   /**
    * Statistiques du DecisionCore
    */
+  clearCurveCooldown(mint: string): void {
+    this.curveCooldowns.delete(mint);
+    this.curveLoggedEnter.delete(mint);
+  }
+
   getStats(): {
     tokensProcessed: number;
     tokensAccepted: number;
     tokensRejected: number;
     acceptanceRate: number;
+    curvesEvaluated: number;
+    curvesEntered: number;
+    curvesSkippedCooldown: number;
+    activeCurvePositions: number;
   } {
     return {
       tokensProcessed: this.tokensProcessed,
@@ -425,6 +546,10 @@ export class DecisionCore extends EventEmitter {
       acceptanceRate: this.tokensProcessed > 0 
         ? (this.tokensAccepted / this.tokensProcessed) * 100 
         : 0,
+      curvesEvaluated: this.curvesEvaluated,
+      curvesEntered: this.curvesEntered,
+      curvesSkippedCooldown: this.curvesSkippedCooldown,
+      activeCurvePositions: this.activeCurvePositions,
     };
   }
 }

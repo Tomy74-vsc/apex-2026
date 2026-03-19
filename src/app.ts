@@ -20,14 +20,38 @@ import { PumpScanner } from './ingestors/PumpScanner.js';
 import { Sniper } from './executor/Sniper.js';
 import { getFeatureStore } from './data/FeatureStore.js';
 import { getPriceTracker } from './data/PriceTracker.js';
-import { getAIBrain } from './engine/AIBrain.js';
+import { getAIBrain, type CurveDecision } from './engine/AIBrain.js';
 import { getModelUpdater } from './engine/ModelUpdater.js';
 import { getShadowAgent } from './engine/ShadowAgent.js';
+import { getCurveTracker } from './modules/curve-tracker/CurveTracker.js';
+import { CurveExecutor, type CurveTradeResult } from './modules/curve-executor/CurveExecutor.js';
+import type { TrackedCurve } from './types/bonding-curve.js';
 import type {
   ScoredToken,
   MarketEvent,
   TokenEventRecord,
 } from './types/index.js';
+
+// Throttle noisy WS errors from @solana/web3.js to max 1 per 30s
+const _origConsoleError = console.error;
+let _lastWsErrorTs = 0;
+let _wsErrorSuppressed = 0;
+console.error = (...args: unknown[]) => {
+  const msg = String(args[0] ?? '');
+  if (msg.includes('ws error') || msg.includes('WebSocket')) {
+    const now = Date.now();
+    if (now - _lastWsErrorTs < 30_000) {
+      _wsErrorSuppressed++;
+      return;
+    }
+    _lastWsErrorTs = now;
+    if (_wsErrorSuppressed > 0) {
+      _origConsoleError(`⚠️  [WS] ${_wsErrorSuppressed} duplicate WS errors suppressed`);
+      _wsErrorSuppressed = 0;
+    }
+  }
+  _origConsoleError(...args);
+};
 
 /**
  * Configuration depuis variables d'environnement
@@ -66,11 +90,15 @@ class APEXBot {
   private telegramPulse: TelegramPulse | null = null;
   private pumpScanner: PumpScanner | null = null;
   private sniper: Sniper | null = null;
+  private curveExecutor: CurveExecutor | null = null;
+  private readonly strategyMode: string;
   private stats: AppStats;
   private dashboardInterval: ReturnType<typeof setInterval> | null = null;
   private isShuttingDown: boolean = false;
 
   constructor(config: AppConfig) {
+    this.strategyMode = process.env.STRATEGY_MODE ?? 'legacy';
+
     // Initialise les statistiques
     this.stats = {
       tokensDetected: 0,
@@ -78,6 +106,16 @@ class APEXBot {
       tokensSniped: 0,
       startTime: Date.now(),
     };
+
+    // Initialise CurveExecutor si en mode curve-prediction
+    if (this.strategyMode === 'curve-prediction') {
+      try {
+        this.curveExecutor = new CurveExecutor();
+        console.log('✅ CurveExecutor initialisé (paper=' + ((process.env.TRADING_MODE ?? 'paper') === 'paper') + ')');
+      } catch (error) {
+        console.error('⚠️  Erreur initialisation CurveExecutor:', error);
+      }
+    }
 
     // Initialise TelegramPulse si les clés sont disponibles
     if (config.telegramApiId && config.telegramApiHash) {
@@ -255,24 +293,115 @@ class APEXBot {
 
     // Événement : Nouveau launch Pump.fun
     if (this.pumpScanner) {
-      this.pumpScanner.on('newLaunch', async (event: MarketEvent) => {
-        console.log(`🚀 [PumpScanner] NewLaunch: ${event.token.mint}`);
-        this.decisionCore.emit('tokenDetected', event.token.mint);
-        this.stats.tokensDetected++;
-        // Traite l'événement via DecisionCore
-        await this.decisionCore.processMarketEvent(event, false);
-      });
+      if (this.strategyMode === 'curve-prediction') {
+        // V3.1: PumpScanner → CurveTracker (passive monitoring, no immediate snipe)
+        this.pumpScanner.on('newLaunch', (event: MarketEvent) => {
+          this.stats.tokensDetected++;
+        });
+      } else {
+        // Legacy: PumpScanner → DecisionCore (snipe at T=0)
+        this.pumpScanner.on('newLaunch', async (event: MarketEvent) => {
+          console.log(`🚀 [PumpScanner] NewLaunch: ${event.token.mint}`);
+          this.decisionCore.emit('tokenDetected', event.token.mint);
+          this.stats.tokensDetected++;
+          await this.decisionCore.processMarketEvent(event, false);
+        });
 
-      this.pumpScanner.on('fastCheck', async (event: MarketEvent) => {
-        console.log(`⚡ [PumpScanner] FastCheck: ${event.token.mint}`);
-        this.decisionCore.emit('tokenDetected', event.token.mint);
-        this.stats.tokensDetected++;
-        // Traite l'événement avec priorité FastCheck
-        await this.decisionCore.processMarketEvent(event, true);
-      });
+        this.pumpScanner.on('fastCheck', async (event: MarketEvent) => {
+          console.log(`⚡ [PumpScanner] FastCheck: ${event.token.mint}`);
+          this.decisionCore.emit('tokenDetected', event.token.mint);
+          this.stats.tokensDetected++;
+          await this.decisionCore.processMarketEvent(event, true);
+        });
+      }
 
       this.pumpScanner.on('error', (error) => {
         console.error('[PumpScanner] ❌ Erreur:', error);
+      });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // V3.1 CurveTracker event wiring
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    if (this.strategyMode === 'curve-prediction') {
+      const curveTracker = getCurveTracker();
+
+      // When a curve enters the HOT zone → run prediction pipeline
+      curveTracker.on('enterHotZone', async (mint: string, curve: TrackedCurve) => {
+        try {
+          const trades = curveTracker.getTradeHistory(mint);
+          const decision = await this.decisionCore.processCurveEvent(curve, trades);
+
+          if (decision?.action === 'ENTER_CURVE' && this.curveExecutor) {
+            this.decisionCore.updateActivePositions(+1);
+            const result = await this.curveExecutor.buy(
+              mint,
+              decision.positionSol,
+              parseInt(process.env.SLIPPAGE_BPS ?? '300'),
+              curve.state.virtualSolReserves,
+              curve.state.virtualTokenReserves,
+            );
+            if (result.success) {
+              this.stats.tokensSniped++;
+              console.log(`💰 [CurveExecutor] BUY ${mint.slice(0, 8)} | ${result.solAmount.toFixed(4)} SOL | sig=${result.signature?.slice(0, 16)}`);
+            } else {
+              this.decisionCore.updateActivePositions(-1);
+              console.log(`❌ [CurveExecutor] BUY FAILED ${mint.slice(0, 8)}: ${result.error}`);
+            }
+          }
+        } catch (err) {
+          console.error(`❌ [CurvePipeline] Error on enterHotZone for ${mint.slice(0, 8)}:`, err);
+        }
+      });
+
+      // Re-evaluate curves on every update (hot tier only, 3s poll)
+      curveTracker.on('curveUpdate', async (mint: string, curve: TrackedCurve) => {
+        if (curve.tier !== 'hot') return;
+        try {
+          const trades = curveTracker.getTradeHistory(mint);
+          await this.decisionCore.processCurveEvent(curve, trades);
+        } catch {
+          // cold path silencieux
+        }
+      });
+
+      curveTracker.on('graduated', (mint: string, curve: TrackedCurve) => {
+        try {
+          getAIBrain().recordCreatorOutcome(curve.state.creator.toBase58(), true);
+          this.decisionCore.clearCurveCooldown(mint);
+          const durationS = (Date.now() - curve.createdAt) / 1_000;
+          getFeatureStore().labelCurveOutcome({
+            mint,
+            graduated: true,
+            finalProgress: curve.progress,
+            finalSol: curve.realSolSOL,
+            durationS,
+          });
+        } catch {
+          // silencieux
+        }
+      });
+
+      curveTracker.on('evicted', (mint: string, reason: string) => {
+        try {
+          const curve = curveTracker.getCurveState(mint);
+          if (curve) {
+            getAIBrain().recordCreatorOutcome(curve.state.creator.toBase58(), false);
+            const durationS = (Date.now() - curve.createdAt) / 1_000;
+            getFeatureStore().labelCurveOutcome({
+              mint,
+              graduated: false,
+              finalProgress: curve.progress,
+              finalSol: curve.realSolSOL,
+              durationS,
+              evictionReason: reason,
+            });
+          }
+          this.decisionCore.clearCurveCooldown(mint);
+        } catch {
+          // silencieux
+        }
       });
     }
   }
@@ -281,8 +410,9 @@ class APEXBot {
    * Démarre le bot
    */
   async start(): Promise<void> {
+    const modeLabel = this.strategyMode === 'curve-prediction' ? 'CURVE PREDICTION' : 'LEGACY SNIPE';
     console.log('\n╔══════════════════════════════════════════════════════════╗');
-    console.log('║         APEX-2026 - Bot HFT Solana                      ║');
+    console.log(`║     APEX-2026 - Bot HFT Solana [${modeLabel}]      ║`);
     console.log('╚══════════════════════════════════════════════════════════╝\n');
 
     try {
@@ -291,20 +421,7 @@ class APEXBot {
       await this.decisionCore.start();
       console.log('✅ DecisionCore démarré\n');
 
-      // Démarre TelegramPulse (avec gestion d'erreurs pour interaction utilisateur)
-      if (this.telegramPulse) {
-        try {
-          console.log('📱 Démarrage de TelegramPulse...');
-          await this.telegramPulse.start();
-          console.log('✅ TelegramPulse démarré\n');
-        } catch (error) {
-          console.error('⚠️  Erreur lors du démarrage TelegramPulse:', error);
-          console.log('⚠️  TelegramPulse désactivé (peut nécessiter login interactif)\n');
-          this.telegramPulse = null;
-        }
-      }
-
-      // Démarre PumpScanner
+      // Démarre PumpScanner (AVANT TelegramPulse qui peut bloquer)
       if (this.pumpScanner) {
         try {
           console.log('🚀 Démarrage de PumpScanner...');
@@ -315,6 +432,20 @@ class APEXBot {
           console.log('⚠️  PumpScanner désactivé\n');
           this.pumpScanner = null;
         }
+      }
+
+      // Démarre CurveTracker si en mode curve-prediction
+      if (this.strategyMode === 'curve-prediction') {
+        try {
+          console.log('📈 Démarrage de CurveTracker...');
+          await getCurveTracker().start();
+          console.log('✅ CurveTracker démarré (mode: curve-prediction)\n');
+        } catch (error) {
+          console.error('⚠️  Erreur lors du démarrage CurveTracker:', error);
+          console.log('⚠️  CurveTracker désactivé\n');
+        }
+      } else {
+        console.log('⚠️  STRATEGY_MODE=' + this.strategyMode + ' (CurveTracker désactivé)\n');
       }
 
       // Démarre ModelUpdater (hot-swap watcher, cold path)
@@ -331,6 +462,16 @@ class APEXBot {
       console.log('✅ Bot démarré avec succès!');
       console.log('📊 Tableau de bord mis à jour toutes les 60 secondes');
       console.log('🛑 Appuyez sur Ctrl+C pour arrêter proprement\n');
+
+      // TelegramPulse en dernier — peut bloquer sur input interactif (téléphone)
+      if (this.telegramPulse) {
+        this.telegramPulse.start().then(() => {
+          console.log('✅ TelegramPulse démarré');
+        }).catch((error) => {
+          console.warn('⚠️  TelegramPulse désactivé:', (error as Error).message?.slice(0, 80));
+          this.telegramPulse = null;
+        });
+      }
 
     } catch (error) {
       console.error('❌ Erreur lors du démarrage:', error);
@@ -364,6 +505,16 @@ class APEXBot {
       await this.decisionCore.stop();
     } catch (error) {
       console.error('❌ Erreur lors de l\'arrêt du DecisionCore:', error);
+    }
+
+    // Arrête CurveTracker
+    if (this.strategyMode === 'curve-prediction') {
+      try {
+        await getCurveTracker().stop();
+        console.log('✅ CurveTracker arrêté');
+      } catch (error) {
+        console.error('❌ Erreur lors de l\'arrêt CurveTracker:', error);
+      }
     }
 
     // Arrête PumpScanner
@@ -449,7 +600,13 @@ class APEXBot {
     console.log('🚀 PumpScanner:');
     console.log(`   Status: ${pumpStats ? (pumpStats.isRunning ? '✅ Actif' : '❌ Inactif') : '⚠️  Non initialisé'}`);
     if (pumpStats) {
-      console.log(`   Transactions traitées: ${pumpStats.processedCount}`);
+      console.log(`   Mode: ${pumpStats.mode} | Min SOL: ${pumpStats.minRegistrationSOL}`);
+      console.log(`   WS: ${pumpStats.activeWsEndpoint} | Reconnects: ${pumpStats.wsReconnects}`);
+      console.log(`   Signatures vues: ${pumpStats.processedCount} | Tx introuvables: ${pumpStats.txNotFound}`);
+      if (pumpStats.mode === 'curve-prediction') {
+        console.log(`   Filtrés (low SOL): ${pumpStats.filteredLowSOL} | Late stage (>80%): ${(pumpStats as any).filteredLateStage ?? 0}`);
+        console.log(`   Curves enregistrées: ${pumpStats.registeredCurves} | Check failed: ${pumpStats.curveCheckFailed}`);
+      }
     }
     console.log('');
     console.log('🎯 Sniper:');
@@ -462,11 +619,23 @@ class APEXBot {
     console.log('');
     const brainStats = getAIBrain().getStats();
     console.log('🧠 AIBrain:');
-    console.log(`   Decisions: ${brainStats.decisions} (BUY: ${brainStats.buys} / SKIP: ${brainStats.skips})`);
-    console.log(`   Buy rate: ${brainStats.buyRate}`);
-    console.log(`   Avg latency: ${brainStats.avgLatencyMs.toFixed(2)}ms`);
-    console.log(`   Avg score: ${brainStats.avgScore.toFixed(1)}`);
+    console.log(`   Snipe: ${brainStats.decisions} (BUY: ${brainStats.buys} / SKIP: ${brainStats.skips}) rate=${brainStats.buyRate}`);
+    console.log(`   Curve: ${brainStats.curveDecisions} (ENTER: ${brainStats.curveEnters}) rate=${brainStats.curveEnterRate}`);
+    console.log(`   Avg latency: ${brainStats.avgLatencyMs.toFixed(2)}ms | Avg score: ${brainStats.avgScore.toFixed(1)}`);
     console.log('');
+
+    if (this.strategyMode === 'curve-prediction') {
+      const ctStats = getCurveTracker().getStats();
+      const fsStore = getFeatureStore();
+      console.log('📈 CurveTracker:');
+      console.log(`   Cold: ${ctStats.cold} | Warm: ${ctStats.warm} | Hot: ${ctStats.hot} | Total: ${ctStats.total}`);
+      console.log(`   Evaluated: ${decisionStats.curvesEvaluated} | Entered: ${decisionStats.curvesEntered} | Skipped (cooldown): ${decisionStats.curvesSkippedCooldown}`);
+      console.log(`   Curve snapshots logged: ${fsStore.getCurveSnapshotCount()}`);
+      const outcomes = fsStore.getCurveOutcomeCount();
+      console.log(`   Outcomes: ${outcomes.total} (🎓 ${outcomes.graduated} / 💀 ${outcomes.evicted})`);
+      console.log('');
+    }
+
     const shadowStats = getShadowAgent().getStats();
     console.log('👻 Shadow Agent:');
     console.log(`   Decisions: ${shadowStats.totalDecisions}`);

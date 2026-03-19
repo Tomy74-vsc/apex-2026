@@ -470,7 +470,6 @@ export class MarketScanner extends EventEmitter {
       });
 
       if (!tx || !tx.transaction) {
-        console.warn('⚠️  Transaction non trouvée:', signature);
         return;
       }
 

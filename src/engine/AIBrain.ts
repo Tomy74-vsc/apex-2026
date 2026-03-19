@@ -22,6 +22,8 @@ import { getFeatureAssembler, type AssembledFeatures } from '../features/Feature
 import { getHawkesEvaluator } from './HawkesEvaluator.js';
 import { getKellyEngine, type PositionSizing } from '../risk/KellyEngine.js';
 import { getCVaRManager, type RiskMetrics } from '../risk/CVaRManager.js';
+import { GraduationPredictor, type PredictionResult } from '../modules/graduation-predictor/GraduationPredictor.js';
+import type { TrackedCurve, CurveTradeEvent } from '../types/bonding-curve.js';
 
 export interface AIDecision {
   mint: string;
@@ -56,6 +58,21 @@ export interface AIDecision {
   };
 }
 
+/**
+ * CurveDecision — result of the curve-prediction pipeline.
+ * Replaces HMM/Hawkes/TFT with GraduationPredictor.predict().
+ */
+export interface CurveDecision {
+  mint: string;
+  action: 'ENTER_CURVE' | 'EXIT_CURVE' | 'HOLD' | 'SKIP';
+  pGrad: number;
+  confidence: number;
+  breakeven: number;
+  prediction: PredictionResult;
+  positionSol: number;
+  latencyMs: number;
+}
+
 // Thresholds
 const BUY_SCORE_THRESHOLD = 60;
 const MIN_CONFIDENCE = 0.35;
@@ -74,12 +91,18 @@ export class AIBrain extends EventEmitter {
     decisions: 0,
     buys: 0,
     skips: 0,
+    curveDecisions: 0,
+    curveEnters: 0,
     avgLatencyMs: 0,
     avgScore: 0,
   };
 
+  private graduationPredictor: GraduationPredictor;
+  private readonly curveLoggedMints: Set<string> = new Set();
+
   constructor() {
     super();
+    this.graduationPredictor = new GraduationPredictor();
     console.log('🧠 [AIBrain] Inference orchestrator initialized');
   }
 
@@ -243,11 +266,82 @@ export class AIBrain extends EventEmitter {
     return decision;
   }
 
+  /**
+   * Curve-prediction pipeline.
+   * Calls GraduationPredictor instead of HMM/Hawkes/TFT.
+   * Guard security kill switches are applied by DecisionCore before calling this.
+   */
+  decideCurve(
+    curve: TrackedCurve,
+    trades: CurveTradeEvent[],
+    socialScore = 0,
+  ): CurveDecision {
+    const t0 = performance.now();
+    this.stats.curveDecisions++;
+
+    const prediction = this.graduationPredictor.predict(curve, trades, socialScore);
+
+    // Position sizing based on pGrad and Kelly fraction
+    const kellyFraction = parseFloat(process.env.KELLY_FRACTION ?? '0.25');
+    const maxPositionPct = parseFloat(process.env.MAX_POSITION_PCT ?? '0.05');
+    const minPositionSol = parseFloat(process.env.MIN_POSITION_SOL ?? '0.05');
+    const bankroll = parseFloat(process.env.PAPER_BANKROLL_SOL ?? '1.0');
+
+    let positionSol = 0;
+    let action: CurveDecision['action'] = prediction.action === 'ENTER_CURVE' ? 'ENTER_CURVE' : 'SKIP';
+
+    if (action === 'ENTER_CURVE') {
+      const rawSize = bankroll * kellyFraction * prediction.pGrad * prediction.confidence;
+      positionSol = Math.max(minPositionSol, Math.min(rawSize, bankroll * maxPositionPct));
+      this.stats.curveEnters++;
+    }
+
+    const latencyMs = performance.now() - t0;
+
+    const decision: CurveDecision = {
+      mint: curve.mint,
+      action,
+      pGrad: prediction.pGrad,
+      confidence: prediction.confidence,
+      breakeven: prediction.breakeven,
+      prediction,
+      positionSol,
+      latencyMs,
+    };
+
+    const isFirst = !this.curveLoggedMints.has(curve.mint);
+    if (isFirst) {
+      this.curveLoggedMints.add(curve.mint);
+      const emoji = action === 'ENTER_CURVE' ? '🎯' : '⏭️';
+      console.log(
+        `${emoji} [AIBrain:Curve] ${curve.mint.slice(0, 8)} | ${action} | ` +
+        `pGrad=${(prediction.pGrad * 100).toFixed(1)}% | conf=${prediction.confidence.toFixed(2)} | ` +
+        `pos=${positionSol.toFixed(3)} SOL | ${latencyMs.toFixed(1)}ms`,
+      );
+    }
+
+    this.emit('curveDecision', decision);
+    return decision;
+  }
+
+  /** Forward to GraduationPredictor for creator outcome tracking. */
+  recordCreatorOutcome(creator: string, graduated: boolean): void {
+    this.graduationPredictor.recordCreatorOutcome(creator, graduated);
+  }
+
+  /** Forward to GraduationPredictor smart money list. */
+  setSmartMoneyList(addresses: string[]): void {
+    this.graduationPredictor.setSmartMoneyList(addresses);
+  }
+
   getStats() {
     return {
       ...this.stats,
       buyRate: this.stats.decisions > 0
         ? (this.stats.buys / this.stats.decisions * 100).toFixed(1) + '%'
+        : '0%',
+      curveEnterRate: this.stats.curveDecisions > 0
+        ? (this.stats.curveEnters / this.stats.curveDecisions * 100).toFixed(1) + '%'
         : '0%',
     };
   }

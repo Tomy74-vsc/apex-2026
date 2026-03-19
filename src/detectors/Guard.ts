@@ -2,6 +2,13 @@ import { Connection, PublicKey, VersionedTransaction } from '@solana/web3.js';
 import { getMint, getAccount, TokenAccountNotFoundError, TokenInvalidAccountOwnerError } from '@solana/spl-token';
 import { createJupiterApiClient, type QuoteResponse, type SwapResponse } from '@jup-ag/api';
 import type { SecurityReport } from '../types/index.js';
+import type { TrackedCurve } from '../types/bonding-curve.js';
+
+export interface CurveGuardResult {
+  allowed: boolean;
+  flags: string[];
+}
+
 
 // SOL mint address
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -576,6 +583,50 @@ export class Guard {
       );
       return { hasLiquidity: false };
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V3.1 Curve-Specific Guards
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  validateCurve(
+    curve: TrackedCurve,
+    activePositions: number,
+  ): CurveGuardResult {
+    const flags: string[] = [];
+    const minProgress = parseFloat(process.env.CURVE_ENTRY_MIN_PROGRESS ?? '0.50');
+    const maxProgress = parseFloat(process.env.CURVE_ENTRY_MAX_PROGRESS ?? '0.80');
+    const maxPositions = parseInt(process.env.MAX_CONCURRENT_CURVE_POSITIONS ?? '5');
+
+    if (curve.state.complete) {
+      flags.push('CURVE_COMPLETE');
+    }
+
+    if (curve.progress < minProgress) {
+      flags.push(`PROGRESS_TOO_LOW:${(curve.progress * 100).toFixed(1)}%<${(minProgress * 100).toFixed(0)}%`);
+    }
+
+    if (curve.progress > maxProgress) {
+      flags.push(`PROGRESS_TOO_HIGH:${(curve.progress * 100).toFixed(1)}%>${(maxProgress * 100).toFixed(0)}%`);
+    }
+
+    if (activePositions >= maxPositions) {
+      flags.push(`MAX_POSITIONS:${activePositions}>=${maxPositions}`);
+    }
+
+    const ageMs = Date.now() - curve.createdAt;
+    const maxHoldMs = parseInt(process.env.MAX_HOLD_TIME_MINUTES ?? '120') * 60_000;
+    if (ageMs > maxHoldMs) {
+      flags.push(`CURVE_TOO_OLD:${Math.round(ageMs / 60_000)}min`);
+    }
+
+    const allowed = flags.length === 0;
+
+    if (!allowed) {
+      console.log(`🛡️ [Guard:Curve] ${curve.mint.slice(0, 8)} BLOCKED: ${flags.join(', ')}`);
+    }
+
+    return { allowed, flags };
   }
 
   /**

@@ -196,3 +196,44 @@ export interface ModelParamsRecord {
   isActive: boolean;
   createdAt: number;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V3.1 Bonding Curve — Prediction Snapshots
+// ═══════════════════════════════════════════════════════════════════════════
+
+export interface CurveSnapshotRecord {
+  id: string;
+  mint: string;
+  timestampMs: number;
+
+  // Curve state
+  progress: number;
+  realSolSOL: number;
+  priceSOL: number;
+  marketCapSOL: number;
+  tier: 'cold' | 'warm' | 'hot';
+  tradeCount: number;
+
+  // Prediction result
+  pGrad: number;
+  confidence: number;
+  breakeven: number;
+  action: string;      // 'ENTER_CURVE' | 'SKIP'
+  vetoReason: string | null;
+
+  // Velocity signals
+  solPerMinute1m: number;
+  solPerMinute5m: number;
+  avgTradeSizeSOL: number;
+  velocityRatio: number;
+
+  // Bot / wallet signals
+  botTransactionRatio: number;
+  smartMoneyBuyerCount: number;
+  creatorIsSelling: number; // 0 or 1 for SQLite
+  freshWalletRatio: number;
+
+  // Latency
+  predictionMs: number;
+  createdAt: number;
+}

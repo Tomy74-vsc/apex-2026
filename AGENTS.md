@@ -13,17 +13,17 @@
 - All stateful services (FeatureStore, scanners, trackers) must flush and close gracefully on SIGINT shutdown.
 
 ## Learned Workspace Facts
-- The project APEX-2026 is a Solana HFT bot structured around MarketScanner, PumpScanner, Guard, DecisionCore, and Sniper executors.
+- The project APEX-2026 is a Solana HFT bot structured around MarketScanner, PumpScanner, Guard, DecisionCore, and Sniper executors. In curve-prediction mode, MarketScanner is disabled to save RPC quota.
 - Guard.ts centralizes all token safety checks via Promise.allSettled with individual timing, RPC racing, top-10 holder concentration (getTokenLargestAccounts), honeypot detection via Jupiter with timeout, Raydium liquidity and LP-burn estimates with timeout.
 - MarketScanner and PumpScanner emit MarketEvent objects (including RaydiumPoolKeys for 0-RPC execution) enriched with triple timestamps (t_source, t_recv, t_act) that DecisionCore uses to compute detailed DecisionLatency metrics.
 - DecisionCore uses AIBrain.decide() (replacing linear scoring) to combine HMM regime, Hawkes intensity, NLP sentiment, smart money signal, and Guard security into final BUY/SKIP decisions with Kelly-sized positions.
 - Sniper.ts uses Jupiter Ultra Swap API (/ultra/v1/order and /ultra/v1/execute) plus Jito bundles, explicit compute budget injection via TransactionMessage.decompile/recompile, and congestion-aware Jito tips.
-- Environment configuration expects unified Solana RPC variables (HELIUS_RPC_URL, HELIUS_WS_URL, QUICKNODE_RPC_URL, RPC_URL) and trading parameters (TRADING_MODE, SLIPPAGE_BPS, MIN_LIQUIDITY, MAX_RISK_SCORE, paper trading amounts).
+- Environment configuration expects unified Solana RPC variables (HELIUS_RPC_URL, HELIUS_WS_URL, QUICKNODE_RPC_URL, RPC_URL) and trading parameters (TRADING_MODE, SLIPPAGE_BPS, MIN_LIQUIDITY, MAX_RISK_SCORE, paper trading amounts). WALLET_PRIVATE_KEY for CurveExecutor must be 64-byte secret (Base58 or JSON array); 32-byte Base58 is a public key and will fail.
 - StateManager (src/engine/StateManager.ts) pre-caches the latest Solana blockhash in RAM every 400ms for 0ms transaction building.
 - MarketScanner filters Token-2022 and known system program IDs (ComputeBudget, SystemProgram, JUP) before emitting events into the pipeline.
-- Both scanners implement WebSocket auto-reconnect with exponential backoff (max 10 attempts) and silent Geyser-to-WebSocket fallback for Helius free tier.
+- PumpScanner uses ws npm package for WebSocket (Bun native WebSocket fails HTTP 101 with Solana RPC). Use perMessageDeflate: false. Public Solana WS primary; Helius WS often 429 on free tier.
 - V3 uses a 3-layer polyglot architecture: Rust cdylib for hot path inference (<10ms), TypeScript/Bun for orchestration, Python for cold path ML training, connected via bun:ffi with BufferPool for GC mitigation.
-- FeatureStore (bun:sqlite) is append-only on the cold path with in-memory buffer flush every 5s, storing feature snapshots, token outcomes, and model params for ML training.
+- FeatureStore (bun:sqlite) is append-only with 5s buffer flush, storing feature snapshots, token outcomes, curve_snapshots, curve_outcomes (labelCurveOutcome on graduated/evicted), and model params for ML training.
 - Cursor rules use .cursor/rules/ MDC format organized by domain (global, typescript, solana, database, ml) instead of legacy .cursorrules.
 
 ## V3 Roadmap — Architecture & Key Decisions

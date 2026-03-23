@@ -237,6 +237,8 @@ export class FeatureStore {
   private buffer: TokenEventRecord[] = [];
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private isClosed = false;
+  /** Chemin chaud : un poll HOT par courbe → statement préparé réutilisé (moins de parse SQLite). */
+  private curveSnapshotInsertStmt: ReturnType<Database['prepare']> | null = null;
 
   private stats = {
     buffered: 0,
@@ -623,7 +625,8 @@ export class FeatureStore {
   appendCurveSnapshot(snap: CurveSnapshotRecord): void {
     if (this.isClosed) return;
     try {
-      this.db.prepare(`
+      if (!this.curveSnapshotInsertStmt) {
+        this.curveSnapshotInsertStmt = this.db.prepare(`
         INSERT OR IGNORE INTO curve_snapshots (
           id, mint, timestamp_ms,
           progress, real_sol_sol, price_sol, market_cap_sol, tier, trade_count,
@@ -632,8 +635,10 @@ export class FeatureStore {
           bot_transaction_ratio, smart_money_buyer_cnt, creator_is_selling, fresh_wallet_ratio,
           social_score,
           prediction_ms, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      }
+      this.curveSnapshotInsertStmt.run(
         snap.id, snap.mint, snap.timestampMs,
         snap.progress, snap.realSolSOL, snap.priceSOL, snap.marketCapSOL, snap.tier, snap.tradeCount,
         snap.pGrad, snap.confidence, snap.breakeven, snap.action, snap.vetoReason,
@@ -775,15 +780,21 @@ export class FeatureStore {
     try {
       return this.db.prepare(`
         SELECT
-          s.mint, s.timestamp_ms, s.progress, s.real_sol_sol, s.price_sol,
-          s.market_cap_sol, s.tier, s.trade_count,
-          s.p_grad, s.confidence, s.breakeven, s.action,
+          s.id, s.mint, s.timestamp_ms, s.created_at,
+          s.progress, s.real_sol_sol, s.price_sol, s.market_cap_sol, s.tier, s.trade_count,
+          s.p_grad, s.confidence, s.breakeven, s.action, s.veto_reason,
           s.sol_per_minute_1m, s.sol_per_minute_5m,
           s.avg_trade_size_sol, s.velocity_ratio,
           s.bot_transaction_ratio, s.smart_money_buyer_cnt,
           s.creator_is_selling, s.fresh_wallet_ratio,
-          s.social_score,
-          o.graduated, o.final_progress, o.final_sol, o.duration_s
+          s.social_score, s.prediction_ms,
+          o.graduated AS label_graduated,
+          o.eviction_reason AS label_eviction_reason,
+          o.final_progress AS label_final_progress,
+          o.final_sol AS label_final_sol,
+          o.duration_s AS label_duration_s,
+          o.snapshots_count AS label_outcome_snapshot_count,
+          o.resolved_at AS label_resolved_at
         FROM curve_snapshots s
         INNER JOIN curve_outcomes o ON s.mint = o.mint
         ORDER BY s.timestamp_ms DESC

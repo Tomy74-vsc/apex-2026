@@ -3,6 +3,7 @@
  */
 
 import { EventEmitter } from 'events';
+import { XAI_RESPONSES_WEB_TOOLS } from './xai-live-search.js';
 
 export interface NarrativeSignal {
   theme: string;
@@ -76,7 +77,7 @@ export class NarrativeRadar extends EventEmitter {
         },
         body: JSON.stringify({
           model: this.model,
-          tools: [{ type: 'x_search' }],
+          tools: XAI_RESPONSES_WEB_TOOLS,
           input: [
             {
               role: 'system',
@@ -89,14 +90,26 @@ export class NarrativeRadar extends EventEmitter {
                 'What Solana memecoins, crypto memes, or narratives are suddenly trending or going viral on X RIGHT NOW in the last 30 minutes? Return ONLY JSON array: [{"theme":"...","velocity":1,"keywords":["..."],"tickers":["$..."],"contractAddresses":["..."],"confidence":0}]',
             },
           ],
-          max_turns: 3,
+          max_output_tokens: 2048,
         }),
-        signal: AbortSignal.timeout(20_000),
+        signal: AbortSignal.timeout(30_000),
       });
 
-      if (!response.ok) return;
+      const rawBody = await response.text();
+      if (!response.ok) {
+        console.warn(
+          `⚠️  [NarrativeRadar] HTTP ${response.status} — ${rawBody.slice(0, 240)}${rawBody.length > 240 ? '…' : ''}`,
+        );
+        return;
+      }
 
-      const data = (await response.json()) as Record<string, unknown>;
+      let data: Record<string, unknown>;
+      try {
+        data = JSON.parse(rawBody) as Record<string, unknown>;
+      } catch {
+        console.warn(`⚠️  [NarrativeRadar] JSON parse error (${rawBody.length} chars)`);
+        return;
+      }
       const blocks = (Array.isArray(data.output)
         ? data.output
         : Array.isArray(data.content)

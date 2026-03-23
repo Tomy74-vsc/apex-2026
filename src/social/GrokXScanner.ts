@@ -1,7 +1,10 @@
 /**
  * Grok X Search — cold-path social overlay (Phase C).
  * Optional: no XAI_API_KEY → all calls return null, no throw.
+ * Recherche live via `search_parameters` (API Responses xAI), pas via tool `x_search` non standard.
  */
+
+import { XAI_RESPONSES_WEB_TOOLS } from './xai-live-search.js';
 
 export interface TokenXSentiment {
   mentionCount: number;
@@ -72,7 +75,7 @@ export class GrokXScanner {
         },
         body: JSON.stringify({
           model: this.model,
-          tools: [{ type: 'x_search' }],
+          tools: XAI_RESPONSES_WEB_TOOLS,
           input: [
             {
               role: 'system',
@@ -84,17 +87,28 @@ export class GrokXScanner {
               content: `Analyze current X/Twitter buzz for Solana token $${ticker} (address: ${mintAddress.slice(0, 16)}…) in the last 30 minutes. Return ONLY JSON: {"mentionCount":0,"sentiment":0,"hypeLevel":0,"botActivity":0,"influencerMentions":0,"keyThemes":[],"confidence":0}`,
             },
           ],
-          max_turns: 2,
+          max_output_tokens: 1024,
         }),
-        signal: AbortSignal.timeout(15_000),
+        signal: AbortSignal.timeout(25_000),
       });
 
+      const rawBody = await response.text();
       if (!response.ok) {
         this.stats.errors++;
+        console.warn(
+          `⚠️  [GrokX] HTTP ${response.status} — ${rawBody.slice(0, 280)}${rawBody.length > 280 ? '…' : ''}`,
+        );
         return null;
       }
 
-      const data = (await response.json()) as Record<string, unknown>;
+      let data: Record<string, unknown>;
+      try {
+        data = JSON.parse(rawBody) as Record<string, unknown>;
+      } catch {
+        this.stats.errors++;
+        console.warn(`⚠️  [GrokX] JSON parse error on response body (${rawBody.length} chars)`);
+        return null;
+      }
       const blocks = (Array.isArray(data.output)
         ? data.output
         : Array.isArray(data.content)
@@ -141,8 +155,9 @@ export class GrokXScanner {
       );
 
       return result;
-    } catch {
+    } catch (err) {
       this.stats.errors++;
+      console.warn(`⚠️  [GrokX] ${err instanceof Error ? err.message : String(err)}`);
       return null;
     }
   }

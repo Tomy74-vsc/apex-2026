@@ -2,7 +2,7 @@
 
 ## Prerequis
 
-- Bun `1.3.10`
+- Bun `>= 1.3.11`
 - TypeScript `5.9.3`
 - Un fichier `.env` derive de `.env.example`
 

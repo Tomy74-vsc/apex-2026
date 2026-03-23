@@ -84,6 +84,7 @@ export class GraduationPredictor {
     socialScore = 0,
     /** Réservé wiring app (social composite déjà fusionné dans socialScore). */
     _grokEnriched = false,
+    options?: { suppressEnterLog?: boolean },
   ): PredictionResult {
     const t0 = performance.now();
 
@@ -102,6 +103,7 @@ export class GraduationPredictor {
         botSignal,
         walletScore,
         t0,
+        options,
       );
     }
 
@@ -218,7 +220,7 @@ export class GraduationPredictor {
       this.bumpVeto('below_breakeven_margin');
     }
 
-    if (action === 'ENTER_CURVE') {
+    if (action === 'ENTER_CURVE' && !options?.suppressEnterLog) {
       console.log(
         `🎯 [GradPredictor] ${curve.mint.slice(0, 8)} pGrad=${(pGrad * 100).toFixed(1)}% > thresh=${(minPGradWithMargin * 100).toFixed(1)}% → ENTER (${latencyMs.toFixed(2)}ms)`,
       );
@@ -245,6 +247,7 @@ export class GraduationPredictor {
     botSignal: BotSignal,
     walletScore: WalletScore,
     t0: number,
+    options?: { suppressEnterLog?: boolean },
   ): PredictionResult {
     /** APEX §6 — heuristique sans trades : confiance basse ⇒ safety_margin ≈ 1.68× */
     const confidence = 0.15;
@@ -319,7 +322,7 @@ export class GraduationPredictor {
       this.bumpVeto('heuristic_below_margin');
     }
 
-    if (action === 'ENTER_CURVE') {
+    if (action === 'ENTER_CURVE' && !options?.suppressEnterLog) {
       console.log(
         `🎯 [GradPredictor:State] ${curve.mint.slice(0, 8)} pGrad=${(pGrad * 100).toFixed(1)}% > thresh=${(minPGradWithMargin * 100).toFixed(1)}% → ENTER (${latencyMs.toFixed(2)}ms)`,
       );

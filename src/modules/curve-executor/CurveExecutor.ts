@@ -245,6 +245,21 @@ export class CurveExecutor {
       };
     }
 
+    if (process.env.TRADING_ENABLED !== 'true') {
+      const ms = performance.now() - t0;
+      console.warn(
+        '⚠️  [CurveExecutor] TRADING_ENABLED!=true — envoi Pump.fun on-chain bloqué (aligné Sniper / garde capital)',
+      );
+      return {
+        success: false,
+        signature: null,
+        solAmount,
+        tokenAmount,
+        error: 'TRADING_ENABLED must be true for live curve execution',
+        latencyMs: ms,
+      };
+    }
+
     // Jito tip instruction (noUncheckedIndexedAccess: arr[i] is string | undefined)
     const tipIdx = Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length);
     const tipPk = JITO_TIP_ACCOUNTS[tipIdx] ?? JITO_TIP_ACCOUNTS[0]!;

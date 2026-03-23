@@ -2,44 +2,24 @@
   "version": 1,
   "transcripts": {
     "C:\\Users\\tomre\\.cursor\\projects\\c-Users-tomre-bot-trading\\agent-transcripts\\02dcf70a-43cc-4647-93b2-1c43bdbe7b86\\02dcf70a-43cc-4647-93b2-1c43bdbe7b86.jsonl": {
-      "mtimeMs": 1774260659099,
-      "lastProcessedAt": "2026-03-23T10:15:42.000Z"
+      "mtimeMs": 1774267930473,
+      "lastProcessedAt": "2026-03-23T14:00:00.000Z"
     },
     "C:\\Users\\tomre\\.cursor\\projects\\c-Users-tomre-bot-trading\\agent-transcripts\\4ee35c48-83f1-4347-aef7-ff087c0635bf\\4ee35c48-83f1-4347-aef7-ff087c0635bf.jsonl": {
-      "mtimeMs": 1773908858368,
-      "lastProcessedAt": "2026-03-23T10:15:42.000Z"
-    },
-    "C:\\Users\\tomre\\.cursor\\projects\\c-Users-tomre-bot-trading\\agent-transcripts\\4ee35c48-83f1-4347-aef7-ff087c0635bf\\subagents\\023f69cb-c951-4b3a-9029-43183f7c146a.jsonl": {
-      "mtimeMs": 1773889983893,
-      "lastProcessedAt": "2026-03-23T10:15:42.000Z"
-    },
-    "C:\\Users\\tomre\\.cursor\\projects\\c-Users-tomre-bot-trading\\agent-transcripts\\4ee35c48-83f1-4347-aef7-ff087c0635bf\\subagents\\1cb7cd44-dfec-4fdc-888a-d26755398c1a.jsonl": {
-      "mtimeMs": 1773769255656,
-      "lastProcessedAt": "2026-03-23T10:15:42.000Z"
-    },
-    "C:\\Users\\tomre\\.cursor\\projects\\c-Users-tomre-bot-trading\\agent-transcripts\\4ee35c48-83f1-4347-aef7-ff087c0635bf\\subagents\\2d6acfd6-0bcb-4374-b222-42cfccda4ee5.jsonl": {
-      "mtimeMs": 1773889992293,
-      "lastProcessedAt": "2026-03-23T10:15:42.000Z"
-    },
-    "C:\\Users\\tomre\\.cursor\\projects\\c-Users-tomre-bot-trading\\agent-transcripts\\4ee35c48-83f1-4347-aef7-ff087c0635bf\\subagents\\899aa99e-c1c3-46fe-9588-ae3ce9988a2e.jsonl": {
-      "mtimeMs": 1773769258228,
-      "lastProcessedAt": "2026-03-23T10:15:42.000Z"
-    },
-    "C:\\Users\\tomre\\.cursor\\projects\\c-Users-tomre-bot-trading\\agent-transcripts\\4ee35c48-83f1-4347-aef7-ff087c0635bf\\subagents\\ac984deb-4be4-4c75-910e-89c35e9fdf58.jsonl": {
-      "mtimeMs": 1773894031007,
-      "lastProcessedAt": "2026-03-23T10:15:42.000Z"
+      "mtimeMs": 1773908858369,
+      "lastProcessedAt": "2026-03-23T14:00:00.000Z"
     },
     "C:\\Users\\tomre\\.cursor\\projects\\c-Users-tomre-bot-trading\\agent-transcripts\\a3b00837-0b23-4f96-8db1-092c0f31aed7\\a3b00837-0b23-4f96-8db1-092c0f31aed7.jsonl": {
-      "mtimeMs": 1773743609327,
-      "lastProcessedAt": "2026-03-23T10:15:42.000Z"
+      "mtimeMs": 1773743609328,
+      "lastProcessedAt": "2026-03-23T14:00:00.000Z"
     },
     "C:\\Users\\tomre\\.cursor\\projects\\c-Users-tomre-bot-trading\\agent-transcripts\\e863fcf7-4d16-45d4-acb9-35934f91d1cf\\e863fcf7-4d16-45d4-acb9-35934f91d1cf.jsonl": {
       "mtimeMs": 1773736534251,
-      "lastProcessedAt": "2026-03-23T10:15:42.000Z"
+      "lastProcessedAt": "2026-03-23T14:00:00.000Z"
     },
     "C:\\Users\\tomre\\.cursor\\projects\\c-Users-tomre-bot-trading\\agent-transcripts\\f87740c0-aacf-493d-8760-8ca28fafd3fd\\f87740c0-aacf-493d-8760-8ca28fafd3fd.jsonl": {
       "mtimeMs": 1773499638751,
-      "lastProcessedAt": "2026-03-23T10:15:42.000Z"
+      "lastProcessedAt": "2026-03-23T14:00:00.000Z"
     }
   }
 }

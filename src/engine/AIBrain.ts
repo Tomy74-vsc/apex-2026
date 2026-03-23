@@ -357,7 +357,9 @@ export class AIBrain extends EventEmitter {
     socialScore = 0,
     grokEnriched = false,
   ): number {
-    return this.graduationPredictor.predict(curve, trades, socialScore, grokEnriched).pGrad;
+    return this.graduationPredictor.predict(curve, trades, socialScore, grokEnriched, {
+      suppressEnterLog: true,
+    }).pGrad;
   }
 
   /** GraduationPredictor only — no Kelly / decision stats. Used for HOT observation snapshots. */
@@ -367,7 +369,9 @@ export class AIBrain extends EventEmitter {
     socialScore = 0,
     grokEnriched = false,
   ): PredictionResult {
-    return this.graduationPredictor.predict(curve, trades, socialScore, grokEnriched);
+    return this.graduationPredictor.predict(curve, trades, socialScore, grokEnriched, {
+      suppressEnterLog: true,
+    });
   }
 
   graduationVetoStats(): Record<string, number> {

@@ -24,7 +24,8 @@ export class BotDetector {
   private knownWalletFirstSeen: Map<string, number> = new Map();
 
   analyze(trades: CurveTradeEvent[]): BotSignal {
-    const buys = trades.filter((t) => t.isBuy);
+    const real = trades.filter((t) => !t.synthetic);
+    const buys = real.filter((t) => t.isBuy);
     if (buys.length < 3) {
       return { freshWalletRatio: 0, uniformTradeSizeRatio: 0, sameBlockBuyCount: 0, botTransactionRatio: 0, isVeto: false };
     }

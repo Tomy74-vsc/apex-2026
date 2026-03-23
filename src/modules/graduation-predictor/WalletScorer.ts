@@ -54,24 +54,42 @@ export class WalletScorer {
     trades: CurveTradeEvent[],
     creator: string,
   ): WalletScore {
+    const hist0 = this.creatorHistory.get(creator);
+    const creatorTokenCount0 = hist0?.total ?? 0;
+    const creatorHistoricalGradRate0 =
+      creatorTokenCount0 > 0 ? (hist0!.graduated / creatorTokenCount0) : 0;
+
     if (trades.length === 0) {
       return {
         smartMoneyBuyerCount: 0,
         smartMoneySOLTotal: 0,
-        creatorHistoricalGradRate: 0,
-        creatorTokenCount: 0,
+        creatorHistoricalGradRate: creatorHistoricalGradRate0,
+        creatorTokenCount: creatorTokenCount0,
         creatorIsSelling: false,
         freshWalletRatio: 0,
         top10BuyVolumeShare: 0,
       };
     }
 
-    // Smart money analysis
+    const realTrades = trades.filter((t) => !t.synthetic);
+    if (realTrades.length === 0) {
+      return {
+        smartMoneyBuyerCount: 0,
+        smartMoneySOLTotal: 0,
+        creatorHistoricalGradRate: creatorHistoricalGradRate0,
+        creatorTokenCount: creatorTokenCount0,
+        creatorIsSelling: false,
+        freshWalletRatio: 0,
+        top10BuyVolumeShare: 0,
+      };
+    }
+
+    // Smart money analysis (wallets réels uniquement)
     const smBuyers = new Set<string>();
     let smSOL = 0;
     const allTraders = new Set<string>();
 
-    for (const trade of trades) {
+    for (const trade of realTrades) {
       allTraders.add(trade.trader);
       if (trade.isBuy && this.smartMoneyAddresses.has(trade.trader)) {
         smBuyers.add(trade.trader);
@@ -80,27 +98,24 @@ export class WalletScorer {
     }
 
     // Creator selling detection — RED FLAG
-    const creatorIsSelling = trades.some(
+    const creatorIsSelling = realTrades.some(
       (t) => !t.isBuy && t.trader === creator,
     );
 
-    // Creator historical graduation rate
-    const hist = this.creatorHistory.get(creator);
-    const creatorTokenCount = hist?.total ?? 0;
-    const creatorHistoricalGradRate =
-      creatorTokenCount > 0 ? (hist!.graduated / creatorTokenCount) : 0;
+    const creatorTokenCount = creatorTokenCount0;
+    const creatorHistoricalGradRate = creatorHistoricalGradRate0;
 
     // Fresh wallet ratio (approximation: wallets seen only in this token)
-    const uniqueTraders = new Set(trades.map((t) => t.trader));
+    const uniqueTraders = new Set(realTrades.map((t) => t.trader));
     const singleAppearance = [...uniqueTraders].filter(
-      (addr) => trades.filter((t) => t.trader === addr).length === 1,
+      (addr) => realTrades.filter((t) => t.trader === addr).length === 1,
     );
     const freshWalletRatio = uniqueTraders.size > 0
       ? singleAppearance.length / uniqueTraders.size
       : 0;
 
     const buyVolBy = new Map<string, number>();
-    for (const t of trades) {
+    for (const t of realTrades) {
       if (!t.isBuy) continue;
       buyVolBy.set(t.trader, (buyVolBy.get(t.trader) ?? 0) + t.solAmount);
     }

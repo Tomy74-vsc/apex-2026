@@ -66,6 +66,8 @@ export interface CurveTradeEvent {
   slot: number;
   timestamp: number;
   signature: string;
+  /** Dérivé du poll (Δ réserves) — utile vélocité ; exclu des heuristiques bot/wallet. */
+  synthetic?: boolean;
 }
 
 /** Evenement de graduation (complete passe a true). */

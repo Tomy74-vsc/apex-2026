@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 /**
  * Export curve_snapshots / curve_outcomes / paper trades to CSV for Excel or training pipelines.
+ * - curve_training_labeled.csv : snapshots HOT (features) JOIN outcomes (labels) — dataset supervisé principal
  * Usage: bun scripts/export-ml-dataset.ts [path/to/apex.db]
  */
 
@@ -53,6 +54,40 @@ try {
     console.log(`✅ Exported ${outcomes.length} outcomes → ${out}`);
   } else {
     console.log('⚠️ No curve_outcomes rows');
+  }
+
+  try {
+    const labeled = db
+      .query(
+        `
+      SELECT
+        s.*,
+        o.graduated AS label_graduated,
+        o.eviction_reason AS label_eviction_reason,
+        o.final_progress AS label_final_progress,
+        o.final_sol AS label_final_sol,
+        o.duration_s AS label_duration_s,
+        o.snapshots_count AS label_outcome_snapshot_count,
+        o.resolved_at AS label_resolved_at
+      FROM curve_snapshots s
+      INNER JOIN curve_outcomes o ON s.mint = o.mint
+      ORDER BY s.timestamp_ms DESC
+      LIMIT 100000
+    `,
+      )
+      .all() as Record<string, unknown>[];
+    if (labeled.length > 0) {
+      const out = 'data/curve_training_labeled.csv';
+      await mkdir(dirname(out), { recursive: true });
+      await Bun.write(out, rowsToCsv(labeled));
+      console.log(
+        `✅ Exported ${labeled.length} labeled rows (snapshots+outcomes) → ${out} (supervisé ML)`,
+      );
+    } else {
+      console.log('⚠️ No labeled rows (need both curve_snapshots and curve_outcomes for same mints)');
+    }
+  } catch (e) {
+    console.log('⚠️ Labeled export skipped:', (e as Error).message);
   }
 
   let openCount = 0;

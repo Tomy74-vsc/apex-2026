@@ -1,7 +1,7 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import { EventEmitter } from 'events';
 import { BatchPoller } from './BatchPoller.js';
-import type { BondingCurveState, TrackedCurve } from '../../types/bonding-curve.js';
+import type { BondingCurveState, TrackedCurve, CurveTradeEvent } from '../../types/bonding-curve.js';
 import { calcProgress, calcPricePerToken, calcMarketCapSOL } from '../../math/curve-math.js';
 import {
   COLD_POLL_INTERVAL_MS,
@@ -246,6 +246,32 @@ export class TieredMonitor extends EventEmitter {
   private updateCurveFromState(curve: TrackedCurve, state: BondingCurveState): void {
     const now = Date.now();
     const oldProgress = curve.progress;
+    const prevSol = curve.state.realSolReserves;
+    const prevToken = curve.state.realTokenReserves;
+    const newSol = state.realSolReserves;
+    const newToken = state.realTokenReserves;
+    const deltaSol = newSol - prevSol;
+    /** Ignore bruit arrondi / micro-mises à jour compte. */
+    const minLamports = 1_000n;
+    if (deltaSol > minLamports || deltaSol < -minLamports) {
+      const solAmount = Math.abs(Number(deltaSol)) / LAMPORTS_PER_SOL;
+      const isBuy = deltaSol > 0n;
+      const tokenDelta = prevToken - newToken;
+      const tokenAmount = tokenDelta >= 0n ? tokenDelta : -tokenDelta;
+      const evt: CurveTradeEvent = {
+        mint: curve.mint,
+        isBuy,
+        solAmount,
+        tokenAmount,
+        trader: '_reserve_flow',
+        slot: Math.floor(now / 1000),
+        timestamp: now,
+        signature: `rsrv:${curve.mint.slice(0, 8)}:${now}`,
+        synthetic: true,
+      };
+      this.emit('syntheticTrade', evt);
+    }
+
     curve.previousProgress = oldProgress;
     curve.state = state;
     curve.progress = calcProgress(state.realTokenReserves);

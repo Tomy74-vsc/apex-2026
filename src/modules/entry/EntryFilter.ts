@@ -33,11 +33,16 @@ export function evaluateEntryGates(
   const firstWindowSec = envFloat('ENTRY_VELOCITY_WINDOW_SEC', 60);
 
   if (ageSec > 0 && ageSec <= firstWindowSec) {
-    if (velocity.solPerMinute_1m < minVel) {
+    /** Si pas encore de Δ réserves (premier HOT), débit implicite = SOL réel / âge — évite blocage à 0. */
+    const solFloor = envFloat('ENTRY_GATE_SOL_FLOOR', 12);
+    const impliedPerMin =
+      curve.realSolSOL >= solFloor ? curve.realSolSOL / Math.max(ageSec / 60, 0.25) : 0;
+    const effVel = Math.max(velocity.solPerMinute_1m, impliedPerMin);
+    if (effVel < minVel) {
       return {
         ok: false,
         failedGate: 'VELOCITY_FIRST_WINDOW',
-        detail: `sol/min ${velocity.solPerMinute_1m.toFixed(3)} < ${minVel} (first ${firstWindowSec}s)`,
+        detail: `sol/min ${velocity.solPerMinute_1m.toFixed(3)} (implied ${impliedPerMin.toFixed(3)}) < ${minVel} (first ${firstWindowSec}s)`,
       };
     }
   }

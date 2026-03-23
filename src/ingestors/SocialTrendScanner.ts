@@ -96,6 +96,11 @@ export class SocialTrendScanner extends EventEmitter {
     return this.boostedMints.has(mint);
   }
 
+  /** Taille du dernier poll Solana (dashboard / santé collecte). */
+  getBoostedMintCount(): number {
+    return this.boostedMints.size;
+  }
+
   stop(): void {
     if (this.boostInterval !== null) {
       clearInterval(this.boostInterval);

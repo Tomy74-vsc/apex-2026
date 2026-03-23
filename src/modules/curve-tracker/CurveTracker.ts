@@ -45,6 +45,15 @@ export class CurveTracker extends EventEmitter {
       this.tradeHistory.delete(mint);
     });
 
+    /** Microstructure / vélocité : flux SOL agrégés entre polls (pas de wallet on-chain ici). */
+    this.tieredMonitor.on('syntheticTrade', (e: CurveTradeEvent) => {
+      try {
+        this.recordTrade(e);
+      } catch {
+        /* cold path */
+      }
+    });
+
     this.tieredMonitor.start();
     this.started = true;
     console.log('🚀 [CurveTracker] Started — monitoring bonding curves');

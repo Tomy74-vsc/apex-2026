@@ -7,6 +7,7 @@ import { getOutcomeTracker } from './OutcomeTracker.js';
 import { getAIBrain, type AIDecision, type CurveDecision } from './AIBrain.js';
 import { getFeatureAssembler } from '../features/FeatureAssembler.js';
 import { getShadowAgent } from './ShadowAgent.js';
+import { getCurveShadowAgent } from './CurveShadowAgent.js';
 import type {
   MarketEvent,
   SecurityReport,
@@ -254,6 +255,12 @@ export class DecisionCore extends EventEmitter {
 
       const brain = getAIBrain();
       const decision = brain.decideCurve(curve, trades, socialScore, grokEnriched);
+
+      try {
+        getCurveShadowAgent().evaluateCurve(curve.mint, decision);
+      } catch {
+        /* cold path — courbe shadow ne doit pas casser le pipeline */
+      }
 
       if (decision.action === 'ENTER_CURVE') {
         this.curvesEntered++;

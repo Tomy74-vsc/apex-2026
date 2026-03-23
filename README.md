@@ -4,11 +4,15 @@ Bot de trading Solana en Bun/TypeScript, orienté detection rapide, scoring, gua
 
 ## Etat actuel
 
-- Runtime principal: Bun `1.3.10`
+- Runtime principal: Bun `>= 1.3.11`
 - TypeScript cible: `5.9.3`
 - Le repo passe `bun run typecheck`
 - Le live trading est desactive par defaut
-- Toute execution live exige `TRADING_ENABLED=true`
+- Toute execution live exige `TRADING_ENABLED=true` (Sniper **et** CurveExecutor Pump.fun si `TRADING_MODE=live`)
+
+### Pump.fun — collecte `curve-prediction` (mars 2026)
+
+Cinq couches actives dans le code : **on-chain** (poll bonding curve + **flux SOL synthétiques** entre polls pour la vélocité), **microstructure** (GraduationPredictor / snapshots), **whale** (outcomes → `whale_wallets`), **social** (Grok xAI optionnel, Groq, TG ou proxy Dex, DexScreener boosts), **quant** (pGrad, breakeven, vetos, `CurveShadowAgent`). Sorties positions : **rotation ~5 min** par défaut (`TIME_STOP_SECONDS` / `HARD_MAX_HOLD_SECONDS` = 300, voir `ExitEngine` au boot). **Outcomes** → SQLite ; **`bun run export:ml`** → CSV (dont `curve_training_labeled.csv`). Détail et limites : **`COLLECTION_RUNBOOK.md`**.
 
 ## Installation
 
@@ -44,6 +48,8 @@ bun run verify
 - `bun run start`
 - `bun run typecheck`
 - `bun run verify`
+- `bun run verify:xai` — smoke test API xAI (Grok)
+- `bun run export:ml` — CSV dataset (`data/`, voir `COLLECTION_RUNBOOK.md`)
 - `bun scripts/test-guard.ts <MINT_ADDRESS>`
 - `bun scripts/test-market-scanner.ts`
 - `bun scripts/test-decision-core.ts`
@@ -52,6 +58,8 @@ bun run verify
 
 - [Quickstart](docs/QUICKSTART.md)
 - [Architecture](docs/ARCHITECTURE.md)
+- [COLLECTION_RUNBOOK.md](COLLECTION_RUNBOOK.md) — collecte ML curve-prediction, export, labels
+- [APEX_QUANT_STRATEGY.md](APEX_QUANT_STRATEGY.md) — stratégie quant (rotation, seuils)
 - [Guard](src/detectors/README.md)
 - [Ingestors](src/ingestors/README.md)
 

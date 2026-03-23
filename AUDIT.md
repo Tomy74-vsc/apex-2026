@@ -48,20 +48,24 @@ PumpScanner (logsSubscribe) → onCurveCreate
        ↓
 CurveTracker.register(mint) → TieredMonitor (Cold/Warm/Hot)
        ↓
-BatchPoller.pollBatch() → stateUpdate
+BatchPoller.pollBatch() → stateUpdate → **Δ réserves → `syntheticTrade` → `CurveTracker.recordTrade`** (vélocité ; bot/wallet ignorent `synthetic`)
        ↓
-CurveTracker.emit('curveUpdate', TrackedCurve)
+TieredMonitor promote HOT → enterHotZone → fetch social (xAI+TG+Dex) → processCurveEvent → buy si ENTER
        ↓
-DecisionCore.processCurveEvent() → cooldown check → AIBrain.decideCurve()
+CurveTracker.emit('curveUpdate', TrackedCurve) — chaque poll
        ↓
-Si ENTER_CURVE + pGrad ≥ breakeven → readyCurveBuy
+tier HOT → ensureSocialForHot (TTL) → appendHotObservationSnapshot (ML)
        ↓
-app.ts → CurveExecutor.buy() (paper)
+DecisionCore.processCurveEvent() (si pas de position) → **CurveShadowAgent.evaluateCurve** (log/désaccord) → executeCurveBuyIfEnter
        ↓
-FeatureStore.appendCurveSnapshot() à chaque curveUpdate
+app.ts → CurveExecutor.buy() (paper si TRADING_MODE=paper)
        ↓
 graduated/evicted → labelCurveOutcome()
 ```
+
+**Export ML** : `bun run export:ml` produit notamment **`curve_training_labeled.csv`** (snapshots JOIN `curve_outcomes`, colonnes `label_*`).
+
+**Démarrage** : en `curve-prediction`, **`CurveTracker.start()`** (TieredMonitor prêt) s’exécute **avant** `PumpScanner.start()`, sinon `registerNewCurve` pouvait no-op (`tieredMonitor` null) si un log WS était traité très tôt.
 
 ### 3.2 Composants clés
 
@@ -76,7 +80,7 @@ graduated/evicted → labelCurveOutcome()
 | AIBrain.decideCurve | ENTER_CURVE / SKIP selon pGrad vs breakeven. | `src/engine/AIBrain.ts` |
 | DecisionCore | Cooldown 30s par mint, déduplication logs. MarketScanner désactivé en curve-prediction. | `src/engine/DecisionCore.ts` |
 | CurveExecutor | Buy/Sell direct Pump.fun. WALLET_PRIVATE_KEY 64-byte Base58. | `src/modules/curve-executor/CurveExecutor.ts` |
-| FeatureStore | curve_snapshots (24 cols), curve_outcomes. labelCurveOutcome sur graduated/evicted. | `src/data/FeatureStore.ts` |
+| FeatureStore | curve_snapshots (~25 cols dont `social_score`), curve_outcomes, `queryLabeledCurveData` pour training. | `src/data/FeatureStore.ts` |
 
 ### 3.3 Heuristique pGrad (sans trades)
 

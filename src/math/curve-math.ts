@@ -32,12 +32,13 @@ export function calcProgress(realTokenReserves: bigint): number {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Prix courant d'un token en lamports bruts (vSol / vToken).
- * Pour obtenir le prix en SOL : diviser par 1e9 puis multiplier par 1e6 (decimals).
+ * Spot price d'une unité minimale de token en SOL (vSol en lamports / vToken en raw 6 déc.).
+ * Utilisé pour mark-to-market : valeur = remainingTokens_raw × ce prix.
+ * Les ratios (impact, expectedReturn) sont inchangés si on multiplie num/denom par la même constante.
  */
 export function calcPricePerToken(vSol: bigint, vToken: bigint): number {
   if (vToken === 0n) return 0;
-  return Number(vSol) / Number(vToken);
+  return Number(vSol) / Number(vToken) / Number(LAMPORTS_PER_SOL);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

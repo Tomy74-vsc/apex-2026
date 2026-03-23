@@ -20,11 +20,16 @@ import { PumpScanner } from './ingestors/PumpScanner.js';
 import { Sniper } from './executor/Sniper.js';
 import { getFeatureStore } from './data/FeatureStore.js';
 import { getPriceTracker } from './data/PriceTracker.js';
-import { getAIBrain, type CurveDecision } from './engine/AIBrain.js';
+import { getAIBrain } from './engine/AIBrain.js';
 import { getModelUpdater } from './engine/ModelUpdater.js';
 import { getShadowAgent } from './engine/ShadowAgent.js';
 import { getCurveTracker } from './modules/curve-tracker/CurveTracker.js';
-import { CurveExecutor, type CurveTradeResult } from './modules/curve-executor/CurveExecutor.js';
+import { CurveExecutor } from './modules/curve-executor/CurveExecutor.js';
+import { GraduationExitStrategy } from './modules/curve-executor/GraduationExitStrategy.js';
+import { getPositionManager } from './modules/position/PositionManager.js';
+import { getExitEngine } from './modules/position/ExitEngine.js';
+import { getCurveVelocityAnalyzer } from './modules/position/curveVelocitySingleton.js';
+import { attachPaperTradeLogger } from './modules/position/PaperTradeLogger.js';
 import type { TrackedCurve } from './types/bonding-curve.js';
 import type {
   ScoredToken,
@@ -95,6 +100,10 @@ class APEXBot {
   private stats: AppStats;
   private dashboardInterval: ReturnType<typeof setInterval> | null = null;
   private isShuttingDown: boolean = false;
+  /** Phase B — throttled pGrad refresh for ExitEngine time-stop (ms). */
+  private readonly livePGradRefreshMs = parseInt(process.env.LIVE_PGRAD_REFRESH_MS ?? '20000', 10) || 20_000;
+  private curveLivePGradLastAt = new Map<string, number>();
+  private curveLivePGradCache = new Map<string, number>();
 
   constructor(config: AppConfig) {
     this.strategyMode = process.env.STRATEGY_MODE ?? 'legacy';
@@ -326,10 +335,22 @@ class APEXBot {
 
     if (this.strategyMode === 'curve-prediction') {
       const curveTracker = getCurveTracker();
+      const slipBps = parseInt(process.env.SLIPPAGE_BPS ?? '300', 10);
+
+      attachPaperTradeLogger();
+
+      getPositionManager().on('positionClosed', (p) => {
+        this.decisionCore.updateActivePositions(-1);
+        this.curveLivePGradCache.delete(p.mint);
+        this.curveLivePGradLastAt.delete(p.mint);
+      });
 
       // When a curve enters the HOT zone → run prediction pipeline
       curveTracker.on('enterHotZone', async (mint: string, curve: TrackedCurve) => {
         try {
+          if (getPositionManager().hasOpenPosition(mint)) {
+            return;
+          }
           const trades = curveTracker.getTradeHistory(mint);
           const decision = await this.decisionCore.processCurveEvent(curve, trades);
 
@@ -338,13 +359,24 @@ class APEXBot {
             const result = await this.curveExecutor.buy(
               mint,
               decision.positionSol,
-              parseInt(process.env.SLIPPAGE_BPS ?? '300'),
+              slipBps,
               curve.state.virtualSolReserves,
               curve.state.virtualTokenReserves,
             );
             if (result.success) {
               this.stats.tokensSniped++;
-              console.log(`💰 [CurveExecutor] BUY ${mint.slice(0, 8)} | ${result.solAmount.toFixed(4)} SOL | sig=${result.signature?.slice(0, 16)}`);
+              const tOpen = performance.now();
+              getPositionManager().openPosition(
+                mint,
+                result.solAmount,
+                result.tokenAmount,
+                curve,
+                decision.pGrad,
+                decision.breakeven,
+              );
+              console.log(
+                `💰 [CurveExecutor] BUY ${mint.slice(0, 8)} | ${result.solAmount.toFixed(4)} SOL | sig=${result.signature?.slice(0, 16)} | ⏱️open+${(performance.now() - tOpen).toFixed(2)}ms`,
+              );
             } else {
               this.decisionCore.updateActivePositions(-1);
               console.log(`❌ [CurveExecutor] BUY FAILED ${mint.slice(0, 8)}: ${result.error}`);
@@ -355,19 +387,91 @@ class APEXBot {
         }
       });
 
-      // Re-evaluate curves on every update (hot tier only, 3s poll)
+      // Open positions: update + exit path on every poll tier; entries only on HOT without position.
       curveTracker.on('curveUpdate', async (mint: string, curve: TrackedCurve) => {
-        if (curve.tier !== 'hot') return;
+        const pm = getPositionManager();
         try {
-          const trades = curveTracker.getTradeHistory(mint);
-          await this.decisionCore.processCurveEvent(curve, trades);
+          if (pm.hasOpenPosition(mint) && this.curveExecutor) {
+            pm.updatePosition(mint, curve);
+            const pos = pm.getPosition(mint);
+            if (pos?.status === 'OPEN') {
+              const trades = curveTracker.getTradeHistory(mint);
+              const velocity = getCurveVelocityAnalyzer().analyze(mint, trades);
+              const nowTs = Date.now();
+              let livePGrad: number | undefined = this.curveLivePGradCache.get(mint);
+              const lastPg = this.curveLivePGradLastAt.get(mint) ?? 0;
+              if (nowTs - lastPg >= this.livePGradRefreshMs) {
+                try {
+                  livePGrad = getAIBrain().curvePredictionPGrad(curve, trades, 0);
+                  this.curveLivePGradCache.set(mint, livePGrad);
+                  this.curveLivePGradLastAt.set(mint, nowTs);
+                } catch {
+                  /* cold path */
+                }
+              }
+              const exitSignal = getExitEngine().evaluate(pos, curve, velocity, { livePGrad });
+              if (exitSignal) {
+                if (exitSignal.action === 'GRADUATION_EXIT_3TRANCHE') {
+                  const grad = new GraduationExitStrategy();
+                  await grad.executeGraduationExit(
+                    pos,
+                    this.curveExecutor,
+                    curve.state.virtualSolReserves,
+                    curve.state.virtualTokenReserves,
+                    slipBps,
+                  );
+                } else {
+                  const toSell =
+                    exitSignal.action === 'SELL_50PCT'
+                      ? (pos.remainingTokens * 50n) / 100n
+                      : pos.remainingTokens;
+                  if (toSell > 0n) {
+                    const sellResult = await this.curveExecutor.sell(
+                      mint,
+                      toSell,
+                      slipBps,
+                      curve.state.virtualSolReserves,
+                      curve.state.virtualTokenReserves,
+                    );
+                    if (sellResult.success) {
+                      if (exitSignal.action === 'SELL_50PCT') {
+                        pm.applyPartialExit(mint, toSell, sellResult.solAmount);
+                      } else {
+                        pm.closeWithFinalLeg(mint, exitSignal.reason, sellResult.solAmount);
+                        getCurveVelocityAnalyzer().clear(mint);
+                        getExitEngine().clearCooldown(mint);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          if (!pm.hasOpenPosition(mint) && curve.tier === 'hot') {
+            const trades = curveTracker.getTradeHistory(mint);
+            await this.decisionCore.processCurveEvent(curve, trades);
+          }
         } catch {
-          // cold path silencieux
+          /* cold path */
         }
       });
 
-      curveTracker.on('graduated', (mint: string, curve: TrackedCurve) => {
+      curveTracker.on('graduated', async (mint: string, curve: TrackedCurve) => {
         try {
+          if (this.curveExecutor) {
+            const pos = getPositionManager().getPosition(mint);
+            if (pos?.status === 'OPEN') {
+              const grad = new GraduationExitStrategy();
+              await grad.executeGraduationExit(
+                pos,
+                this.curveExecutor,
+                curve.state.virtualSolReserves,
+                curve.state.virtualTokenReserves,
+                slipBps,
+              );
+            }
+          }
           getAIBrain().recordCreatorOutcome(curve.state.creator.toBase58(), true);
           this.decisionCore.clearCurveCooldown(mint);
           const durationS = (Date.now() - curve.createdAt) / 1_000;
@@ -440,6 +544,11 @@ class APEXBot {
           console.log('📈 Démarrage de CurveTracker...');
           await getCurveTracker().start();
           console.log('✅ CurveTracker démarré (mode: curve-prediction)\n');
+          getFeatureStore();
+          const restored = getPositionManager().restoreFromFeatureStore();
+          if (restored > 0) {
+            this.decisionCore.syncActiveCurveSlotCount(getPositionManager().getOpenCount());
+          }
         } catch (error) {
           console.error('⚠️  Erreur lors du démarrage CurveTracker:', error);
           console.log('⚠️  CurveTracker désactivé\n');
@@ -490,6 +599,15 @@ class APEXBot {
 
     this.isShuttingDown = true;
     console.log('\n\n🛑 Arrêt du bot en cours...');
+
+    if (this.strategyMode === 'curve-prediction') {
+      try {
+        getPositionManager().flushPersistenceSync();
+        console.log('💾 [PositionManager] Open positions flushed to SQLite');
+      } catch {
+        /* silencieux */
+      }
+    }
 
     // Arrête le tableau de bord
     if (this.dashboardInterval) {
@@ -628,11 +746,53 @@ class APEXBot {
       const ctStats = getCurveTracker().getStats();
       const fsStore = getFeatureStore();
       console.log('📈 CurveTracker:');
-      console.log(`   Cold: ${ctStats.cold} | Warm: ${ctStats.warm} | Hot: ${ctStats.hot} | Total: ${ctStats.total}`);
-      console.log(`   Evaluated: ${decisionStats.curvesEvaluated} | Entered: ${decisionStats.curvesEntered} | Skipped (cooldown): ${decisionStats.curvesSkippedCooldown}`);
+      console.log(
+        `   Cold: ${ctStats.cold} | Warm: ${ctStats.warm} | Hot: ${ctStats.hot} | Total: ${ctStats.total} | Evictions: ${ctStats.evictions}`,
+      );
+      console.log(
+        `   Evaluated: ${decisionStats.curvesEvaluated} | Entered: ${decisionStats.curvesEntered} | Cooldown: ${decisionStats.curvesSkippedCooldown} | EntryFilter⛔: ${decisionStats.entryGateRejected}`,
+      );
+      const gv = brainStats.graduationVetos as Record<string, number> | undefined;
+      if (gv && Object.keys(gv).length > 0) {
+        const top = Object.entries(gv)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 6)
+          .map(([k, v]) => `${k}=${v}`)
+          .join(' ');
+        console.log(`   Predictor vetos: ${top}`);
+      }
       console.log(`   Curve snapshots logged: ${fsStore.getCurveSnapshotCount()}`);
       const outcomes = fsStore.getCurveOutcomeCount();
       console.log(`   Outcomes: ${outcomes.total} (🎓 ${outcomes.graduated} / 💀 ${outcomes.evicted})`);
+      console.log('');
+
+      const bankroll = parseFloat(process.env.PAPER_BANKROLL_SOL ?? '1');
+      const pm = getPositionManager();
+      const port = pm.getPortfolioSummary();
+      const closed = pm.getClosedPositions();
+      console.log('💼 Portfolio (curve positions):');
+      console.log(
+        `   Bankroll(ref): ${bankroll.toFixed(3)} SOL | Invested(now): ${port.totalInvested.toFixed(4)} SOL`,
+      );
+      const uPct = port.totalUnrealizedPnlPct * 100;
+      console.log(
+        `   Open: ${port.openCount} | Unrlzd: ${port.totalUnrealizedPnl >= 0 ? '+' : ''}${port.totalUnrealizedPnl.toFixed(4)} SOL (${uPct.toFixed(1)}%)`,
+      );
+      for (const p of pm.getOpenPositions()) {
+        const ic = p.unrealizedPnlPct >= 0 ? '📈' : '📉';
+        console.log(
+          `   ${ic} ${p.mint.slice(0, 8)}… | ${p.originalEntrySol.toFixed(3)} SOL in | prog ${(p.currentProgress * 100).toFixed(0)}% | PnL ${(p.unrealizedPnlPct * 100).toFixed(1)}%`,
+        );
+      }
+      console.log(
+        `   Closed: ${closed.length} | WR ${(port.winRate * 100).toFixed(0)}% | Realized: ${port.totalRealizedPnl >= 0 ? '+' : ''}${port.totalRealizedPnl.toFixed(4)} SOL`,
+      );
+      if (port.bestTrade?.realizedPnlPct != null) {
+        console.log(`   Best: +${(port.bestTrade.realizedPnlPct * 100).toFixed(1)}% (${port.bestTrade.mint.slice(0, 8)}…)`);
+      }
+      if (port.worstTrade?.realizedPnlPct != null) {
+        console.log(`   Worst: ${(port.worstTrade.realizedPnlPct * 100).toFixed(1)}% (${port.worstTrade.mint.slice(0, 8)}…)`);
+      }
       console.log('');
     }
 

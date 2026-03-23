@@ -158,7 +158,9 @@ export class BatchPoller extends EventEmitter {
 
     try {
       if (this.connections.length === 1) {
-        return await this.connections[0].getMultipleAccountsInfo(keys, 'confirmed');
+        const conn = this.connections[0];
+        if (!conn) return [];
+        return await conn.getMultipleAccountsInfo(keys, 'confirmed');
       }
 
       return await Promise.any(

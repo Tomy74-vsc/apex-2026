@@ -23,7 +23,10 @@ import { getHawkesEvaluator } from './HawkesEvaluator.js';
 import { getKellyEngine, type PositionSizing } from '../risk/KellyEngine.js';
 import { getCVaRManager, type RiskMetrics } from '../risk/CVaRManager.js';
 import { GraduationPredictor, type PredictionResult } from '../modules/graduation-predictor/GraduationPredictor.js';
+import { calcExpectedReturnOnGraduation } from '../math/curve-math.js';
 import type { TrackedCurve, CurveTradeEvent } from '../types/bonding-curve.js';
+
+const LAMPORTS_PER_SOL_BIG = 1_000_000_000n;
 
 export interface AIDecision {
   mint: string;
@@ -281,19 +284,38 @@ export class AIBrain extends EventEmitter {
 
     const prediction = this.graduationPredictor.predict(curve, trades, socialScore);
 
-    // Position sizing based on pGrad and Kelly fraction
-    const kellyFraction = parseFloat(process.env.KELLY_FRACTION ?? '0.25');
+    const kellyEta = parseFloat(process.env.KELLY_FRACTION ?? '0.25');
     const maxPositionPct = parseFloat(process.env.MAX_POSITION_PCT ?? '0.05');
     const minPositionSol = parseFloat(process.env.MIN_POSITION_SOL ?? '0.05');
+    const maxPositionSol = parseFloat(process.env.MAX_POSITION_SOL ?? '0.5');
     const bankroll = parseFloat(process.env.PAPER_BANKROLL_SOL ?? '1.0');
+    const minKellyFrac = parseFloat(process.env.MIN_KELLY_FRACTION ?? '0.01');
 
     let positionSol = 0;
     let action: CurveDecision['action'] = prediction.action === 'ENTER_CURVE' ? 'ENTER_CURVE' : 'SKIP';
 
     if (action === 'ENTER_CURVE') {
-      const rawSize = bankroll * kellyFraction * prediction.pGrad * prediction.confidence;
-      positionSol = Math.max(minPositionSol, Math.min(rawSize, bankroll * maxPositionPct));
-      this.stats.curveEnters++;
+      const realSolLamports = BigInt(Math.round(curve.realSolSOL * Number(LAMPORTS_PER_SOL_BIG)));
+      const priceMultiple = calcExpectedReturnOnGraduation(realSolLamports);
+      const b = Math.max(0, priceMultiple - 1);
+      const p = prediction.pGrad;
+      const q = 1 - p;
+      const fStar = b > 1e-9 ? (b * p - q) / b : 0;
+      const fCap = Math.max(0, fStar * kellyEta);
+
+      if (fCap < minKellyFrac) {
+        action = 'SKIP';
+      } else {
+        const rawSol = bankroll * Math.min(fCap, maxPositionPct);
+        const capSol = Math.min(bankroll * maxPositionPct, maxPositionSol);
+        const sized = Math.min(rawSol, capSol);
+        if (sized < minPositionSol) {
+          action = 'SKIP';
+        } else {
+          positionSol = Math.max(minPositionSol, sized);
+          this.stats.curveEnters++;
+        }
+      }
     }
 
     const latencyMs = performance.now() - t0;
@@ -324,6 +346,15 @@ export class AIBrain extends EventEmitter {
     return decision;
   }
 
+  /** Re-score pGrad for exit-engine time-stop (throttle in app.ts). */
+  curvePredictionPGrad(curve: TrackedCurve, trades: CurveTradeEvent[], socialScore = 0): number {
+    return this.graduationPredictor.predict(curve, trades, socialScore).pGrad;
+  }
+
+  graduationVetoStats(): Record<string, number> {
+    return this.graduationPredictor.getVetoStats();
+  }
+
   /** Forward to GraduationPredictor for creator outcome tracking. */
   recordCreatorOutcome(creator: string, graduated: boolean): void {
     this.graduationPredictor.recordCreatorOutcome(creator, graduated);
@@ -343,6 +374,7 @@ export class AIBrain extends EventEmitter {
       curveEnterRate: this.stats.curveDecisions > 0
         ? (this.stats.curveEnters / this.stats.curveDecisions * 100).toFixed(1) + '%'
         : '0%',
+      graduationVetos: this.graduationPredictor.getVetoStats(),
     };
   }
 }

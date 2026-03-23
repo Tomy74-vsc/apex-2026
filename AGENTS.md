@@ -1,5 +1,5 @@
 ## Learned User Preferences
-- Treat the assistant as the Lead Engineer for the APEX-2026 HFT Solana bot, prioritizing ultra-low latency and capital preservation.
+- Treat the assistant as the Lead Engineer for the APEX-2026 HFT Solana bot, prioritizing ultra-low latency, capital preservation, and tight execution efficiency on performance-sensitive roadmap work (curve polling, position/exit paths, RPC usage).
 - Prefer Bun as the only runtime (no Node.js, npm, yarn, or npx) with strict ESNext TypeScript and no implicit any.
 - Always favor parallel, non-blocking flows: Promise.allSettled for independent checks (never Promise.all when individual failures are acceptable), Promise.any for RPC racing across multiple Solana endpoints.
 - Require on-chain safety checks to go through Guard.ts, keeping public interfaces and shared types (like SecurityReport and validateToken) stable across refactors.
@@ -9,7 +9,7 @@
 - Rely on Jupiter APIs (quote/swap/Ultra) and Jito bundles for execution, but keep all HTTP calls on Bun fetch with explicit timeouts and graceful error handling.
 - Default trading mode to paper trading with conservative risk parameters unless the user explicitly switches to live trading.
 - Every external call (RPC, Jupiter, HTTP) must have an explicit timeout — never allow a call to block indefinitely.
-- When fixing a specific issue, apply targeted minimal changes ("ne touche a rien d'autre") — do not modify surrounding code.
+- When fixing a specific issue, apply targeted minimal changes ("ne touche a rien d'autre") — do not modify surrounding code; when the user ties the fix to the plan, keep it strictly within roadmapv3/v4 and APEX_QUANT_STRATEGY scope (no unrelated refactors).
 - All stateful services (FeatureStore, scanners, trackers) must flush and close gracefully on SIGINT shutdown.
 
 ## Learned Workspace Facts
@@ -105,3 +105,51 @@
 - src/modules/curve-executor/ — CurveExecutor.ts, JitoBundler.ts, GraduationExitStrategy.ts
 - src/modules/risk/ — StallDetector.ts, PortfolioGuard.ts
 - scripts/test-curve-decode.ts — Live validation script
+
+## Roadmap documents (repo root) — roles
+- **roadmap.md** — V3 technical audit (FFI, GC, gRPC vs WS, ONNX, BAM) + Phases 1→5 tickets (rust_core, StreamRouter, SniperV3, Drift, RL, ~52–76 dev-days).
+- **roadmapv2.md** — Bonding-curve implementation map (Marino): P0–P4 sprints; Sprint 1–3 largely done under `src/modules/`, `src/constants/pumpfun.ts`; Sprint 4 still partial (HolderDistribution, StallDetector, PortfolioGuard, curve JitoBundler, Kelly P(grad)).
+- **roadmapv3.md** — Ops closure + “yeux partout”: TieredMonitor evictions, predictor hardening (`lastPromotedToHot`, SAFETY_MARGIN, min trades), SocialTrendScanner, TelegramTokenScanner, WhaleWalletDB. **Paths:** `src/modules/position/`, `src/modules/curve-executor/GraduationExitStrategy.ts` (not duplicate `src/trading/`).
+- **roadmapv4.md** — HFT narrative: WS pool, EntryFilter, Grok, whale bootstrap, FeatureEngineer+LightGBM+PPO+ModelOrchestrator, dashboard WS. **Guérilla caveat:** second Helius key / Alchemy / Grok = optional extended stack; core must run on Helius+QuickNode+Groq+DexScreener unless opted in.
+- **APEX_QUANT_STRATEGY.md** — **Quant source of truth** (20 Mar 2026): ~1.15% blind snipe EV negative; conditional P(grad|vSol,X); breakeven table; **sweet spot ~35–55 SOL (55–75% progress)**; **7-signal weights** (Trading Intensity 0.35, Velocity+ratio 0.20, anti-bot 0.15, holder 0.10, smart $ 0.08, social 0.07, progress sigmoid 0.05); **vetos V1–V5**; **safety_margin(confidence) = 1 + (1−c)×0.8**; exits: **10 min time stop if pGrad<50%**, stall v<0.1 SOL/min **2 min**, grad **40/35/25%** with **T2 ~60s** (env), T3 trailing + short max hold; Kelly quarter with caps.
+- **PHASE_AB_VALIDATION.md** — Checklist paper 2–4 h + envs Phase A/B alignés APEX / roadmapv3 (M1–M4, P2/P3).
+
+## Status post–Phase A (March 2026)
+- **Done (Phase A complete):** `PositionManager` (+ SQLite `open_curve_positions` debounced persist, restore on boot, flush on shutdown), `ExitEngine`, `GraduationExitStrategy` (env `GRAD_T1_PCT` / `GRAD_T2_PCT`, `GRAD_T2_DELAY_MS` / `GRAD_T3_DELAY_MS` + legacy `GRAD_EXIT_T2_MS`; défauts APEX **40 / 35 %**, T2 **60 s**), `PaperTradeLogger` → `data/paper_trades.jsonl`, `curveVelocitySingleton`, `app.ts` wiring + `DecisionCore.syncActiveCurveSlotCount` after restore, console portfolio block.
+- **Env:** `CURVE_POSITION_PERSIST=0` disables position DB rows; `PAPER_TRADE_LOG=0` disables JSONL; `PAPER_TRADE_LOG_PATH` overrides log file.
+- **Validation paper :** checklist **`PHASE_AB_VALIDATION.md`** (2–4 h, SQLite `curve_snapshots` / `curve_outcomes`, logs EntryFilter + ExitEngine).
+
+## Status post–Phase B (March 2026)
+- **Done:** `TrackedCurve` lifecycle fields; `TieredMonitor` aggressive evictions + 60s sweep + **no evict** if open position; `BreakevenCurve.safetyMarginFromConfidence` + `calcBreakevenWithConfidence` (APEX §6, pas seulement ×1.5 fixe roadmapv3); `GraduationPredictor` **7 poids APEX §5**, **vétos V1→V5 dans l’ordre doc** puis gates roadmapv3 (`min_trades`, `early_hot`, `velocity_ratio`); **holder quality** = `(1 − freshWalletRatio) × (1 − top10BuyVolumeShare)` avec `top10BuyVolumeShare` = part SOL des 10 plus gros acheteurs sur l’historique trade (proxy jusqu’à HolderDistribution on-chain); heuristique **0 trade** : `confidence=0.35`, bande `CURVE_ENTRY_*` + veto **V5** stale age; `getVetoStats()`; `EntryFilter.ts` → `DecisionCore`; `AIBrain` Kelly `b=M−1`, **`MAX_POSITION_SOL`** cap (APEX §7), `MIN_KELLY_FRACTION` skip, `curvePredictionPGrad`; `ExitEngine` defaults APEX §8 (`TIME_STOP_SECONDS` 600, stall 120 s, `livePGrad` vs `TIME_STOP_MIN_PGRAD`); `app` cache pGrad + dashboard.
+- **Still open (Phase C+):** WebSocketPool; social/whale/ML; PumpSwap post-grad; **trailing 15 % sur le reste après TP 50 %** (APEX §8 phrase 6); v2 Sprint 4; éviction COLD « 15 min + pGrad » roadmapv4 (non branchée au prédicteur dans `TieredMonitor`).
+
+## Unified implementation plan (step order; all paths under `src/` unless noted)
+
+**Phase A — DONE** (v3 M1–M4 + v4 P0 core)  
+Position book, exit cascade, 3-tranche grad, app + dashboard, **persist + restore + paper trade log**.
+
+**Phase B — DONE** (v3 P2/P3 + APEX §4–8 + v4 1B/1C)  
+Key envs: `CURVE_ENTRY_MIN_PROGRESS` / `CURVE_ENTRY_MAX_PROGRESS`, `MIN_TRADING_INTENSITY`, `MIN_TRADE_COUNT`, `MIN_MINUTES_IN_HOT`, `VETO_BOT_RATIO`, `VETO_MAX_AGE_MINUTES`, `TIER_*`, `TIME_STOP_SECONDS`, `STALL_DURATION_SECONDS`, `STALL_VELOCITY_THRESHOLD`, `TIME_STOP_MIN_PGRAD`, `LIVE_PGRAD_REFRESH_MS`, `MIN_KELLY_FRACTION`, **`MAX_POSITION_SOL`**, `MIN_VELOCITY_SOL_MIN`, `MAX_TRIVIAL_TX_RATIO`, `TRIVIAL_TX_SOL`. Voir **`PHASE_AB_VALIDATION.md`** pour le run paper.
+
+**Phase C — Infra stability (v4 1A)**  
+8. `src/infra/WebSocketPool.ts`: multi-URL failover, ping/pong, resubscribe, dedup by sig/slot; refactor `PumpScanner` to consume pool (`ws`, `perMessageDeflate: false`).
+
+**Phase D — Social + whales (v3 M5–M7 + v4 2A/2B/2C; Grok optional)**  
+9. `SocialTrendScanner.ts` + `app.ts` wiring (DexScreener + PumpPortal).  
+10. `DexScreenerMonitor.ts` (if not folded into 9) + events for scoring.  
+11. `TelegramTokenScanner.ts` (GramJS + DexScreener discovery) → cache → `socialScore` into predictor (APEX social blend).  
+12. `WhaleWalletDB.ts` + FeatureStore table + `scripts/discover-whales.ts` + boot `loadIntoSmartMoneyTracker()`.  
+13. **Optional:** `src/social/GrokXScanner.ts` + `SentimentAggregator.ts` (xAI credits) — **cold path / overlay only**, never sole trigger.
+
+**Phase E — ML flywheel (v4 P3 + roadmap.md Phase 3)**  
+14. `FeatureEngineer.ts` — 32 features from `curve_snapshots` + placeholders for social/whale.  
+15. `python/train_graduation_model.py`, `export_onnx.py`, hook `retrain_pipeline.py`; promote when AUCPR > threshold.  
+16. `ModelOrchestrator.ts` (or extend `ModelUpdater`) + ShadowAgent A/B; Rust `ort` or agreed TS ONNX path.
+
+**Phase F — Execution + risk debt (roadmapv2 P4 + roadmap.md P4)**  
+17. `HolderDistribution.ts`, `StallDetector.ts` (if not fully subsumed by ExitEngine), `PortfolioGuard.ts`, curve `JitoBundler.ts`, `SniperV3`/`JitoTipOracle`, Drift — by priority after data validates edge.
+
+**Validation gates**  
+- **A+B:** Suivre **`PHASE_AB_VALIDATION.md`** (2–4 h paper): positions open/close, `paper_trades.jsonl`, evictions > 0, `curve_outcomes` / `curve_snapshots` qui croissent, HOT enter rate **≪ 100%**, vetos + EntryFilter visibles.  
+- **C:** DexScreener/PumpPortal lines in logs; whale table non-empty after script.  
+- **E:** ML only with **500–1000+** labeled curves minimum for experiments; v4 asks **10k+** for production confidence.

@@ -109,8 +109,10 @@ export class CurveTracker extends EventEmitter {
     return Array.from(this.tieredMonitor.hot.values());
   }
 
-  getStats(): { cold: number; warm: number; hot: number; total: number } {
-    if (!this.tieredMonitor) return { cold: 0, warm: 0, hot: 0, total: 0 };
+  getStats(): { cold: number; warm: number; hot: number; total: number; evictions: number } {
+    if (!this.tieredMonitor) {
+      return { cold: 0, warm: 0, hot: 0, total: 0, evictions: 0 };
+    }
     return this.tieredMonitor.getStats();
   }
 

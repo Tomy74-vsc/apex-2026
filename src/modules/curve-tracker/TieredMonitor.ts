@@ -8,14 +8,24 @@ import {
   WARM_POLL_INTERVAL_MS,
   HOT_POLL_INTERVAL_MS,
   KOTH_SOL_THRESHOLD,
-  STALE_CURVE_TTL_MS,
 } from '../../constants/pumpfun.js';
+import { getPositionManager } from '../position/PositionManager.js';
 
 const MAX_COLD = 5_000;
 const MAX_WARM = 200;
 const MAX_HOT = 30;
 const WARM_STALE_MS = 6 * 60 * 60_000; // 6h without change → demote
 const LAMPORTS_PER_SOL = 1_000_000_000;
+
+/** Phase B eviction tuning (env override, minutes/ms). */
+const MS = 60_000;
+const HOT_STALL_MIN = parseInt(process.env.TIER_HOT_STALL_MIN ?? '30', 10) || 30;
+const HOT_MAX_AGE_MIN = parseInt(process.env.TIER_HOT_MAX_AGE_MIN ?? '60', 10) || 60;
+const WARM_MAX_AGE_MIN = parseInt(process.env.TIER_WARM_MAX_AGE_MIN ?? '120', 10) || 120;
+const COLD_STALE_MIN = parseInt(process.env.TIER_COLD_STALE_MIN ?? '120', 10) || 120;
+const PROGRESS_COLLAPSE_MIN = parseInt(process.env.TIER_PROGRESS_COLLAPSE_MIN ?? '10', 10) || 10;
+const HOT_PROGRESS_EPS = 0.01;
+const EVICTION_SWEEP_MS = parseInt(process.env.TIER_EVICTION_SWEEP_MS ?? '60000', 10) || 60_000;
 
 export class TieredMonitor extends EventEmitter {
   readonly cold: Map<string, TrackedCurve> = new Map();
@@ -27,6 +37,8 @@ export class TieredMonitor extends EventEmitter {
   private coldInterval: ReturnType<typeof setInterval> | null = null;
   private warmInterval: ReturnType<typeof setInterval> | null = null;
   private hotInterval: ReturnType<typeof setInterval> | null = null;
+  private evictionSweep: ReturnType<typeof setInterval> | null = null;
+  private evictionCount = 0;
 
   constructor(connections: Connection[]) {
     super();
@@ -70,6 +82,7 @@ export class TieredMonitor extends EventEmitter {
     const progress = initialState ? calcProgress(state.realTokenReserves) : 0;
     const realSolSOL = initialState ? Number(state.realSolReserves) / LAMPORTS_PER_SOL : 0;
 
+    const now = Date.now();
     const curve: TrackedCurve = {
       mint,
       bondingCurvePDA,
@@ -79,11 +92,12 @@ export class TieredMonitor extends EventEmitter {
       priceSOL: initialState ? calcPricePerToken(state.virtualSolReserves, state.virtualTokenReserves) : 0,
       marketCapSOL: initialState ? calcMarketCapSOL(state.virtualSolReserves, state.virtualTokenReserves) : 0,
       isKOTH: realSolSOL >= KOTH_SOL_THRESHOLD,
-      createdAt: Date.now(),
-      lastUpdated: Date.now(),
+      createdAt: now,
+      lastUpdated: now,
       tier: 'cold',
       tradeCount: 0,
       metadata: metadata ?? {},
+      lastProgressChangeAt: now,
     };
 
     this.cold.set(mint, curve);
@@ -100,6 +114,10 @@ export class TieredMonitor extends EventEmitter {
       this.cold.delete(mint);
       this.enforceCapacity(this.hot, MAX_HOT);
       curve.tier = 'hot';
+      const t = Date.now();
+      curve.lastPromotedToHot = t;
+      curve.hotSince = t;
+      curve.progressAtHotEntry = newProgress;
       this.hot.set(mint, curve);
       console.log(`🔥 [TieredMonitor] ${mint.slice(0, 8)} entered HOT zone (${(newProgress * 100).toFixed(1)}%)`);
       this.emit('enterHotZone', mint, curve);
@@ -117,16 +135,58 @@ export class TieredMonitor extends EventEmitter {
 
   private demoteOrEvict(mint: string, curve: TrackedCurve): void {
     const now = Date.now();
-    const age = now - curve.createdAt;
+    try {
+      if (getPositionManager().hasOpenPosition(mint)) {
+        return;
+      }
+    } catch {
+      /* cold path */
+    }
+
+    const ageMs = now - curve.createdAt;
+    const ageMin = ageMs / MS;
 
     if (curve.state.complete) {
       this.evict(mint, 'graduated');
       return;
     }
 
-    if (curve.tier === 'cold' && age > STALE_CURVE_TTL_MS && curve.progress < 0.10) {
-      this.evict(mint, 'stale_cold_24h');
+    // Global: dead curve with almost no progress
+    if (curve.progress < 0.05 && ageMin > PROGRESS_COLLAPSE_MIN) {
+      this.evict(mint, 'progress_collapsed');
       return;
+    }
+
+    if (curve.tier === 'hot') {
+      if (ageMin > HOT_MAX_AGE_MIN) {
+        this.evict(mint, 'hot_timeout_60min');
+        return;
+      }
+      const hotSince = curve.hotSince ?? curve.lastPromotedToHot ?? curve.createdAt;
+      const hotAgeMin = (now - hotSince) / MS;
+      const progDelta = curve.progress - (curve.progressAtHotEntry ?? curve.progress);
+      if (hotAgeMin > HOT_STALL_MIN && progDelta < HOT_PROGRESS_EPS) {
+        this.evict(mint, 'hot_stalled_30min');
+        return;
+      }
+    }
+
+    if (curve.tier === 'warm') {
+      if (ageMin > WARM_MAX_AGE_MIN) {
+        this.evict(mint, 'warm_timeout_2h');
+        return;
+      }
+      if (ageMin > 30 && curve.progress < 0.2) {
+        this.evict(mint, 'warm_regressed');
+        return;
+      }
+    }
+
+    if (curve.tier === 'cold') {
+      if (ageMin > COLD_STALE_MIN && curve.progress < 0.15) {
+        this.evict(mint, 'cold_stale_2h');
+        return;
+      }
     }
 
     if (curve.tier === 'warm' && (now - curve.lastUpdated) > WARM_STALE_MS) {
@@ -141,6 +201,7 @@ export class TieredMonitor extends EventEmitter {
     this.warm.delete(mint);
     this.hot.delete(mint);
     this.batchPoller.unregister(mint);
+    this.evictionCount++;
     this.emit('evicted', mint, reason);
   }
 
@@ -166,13 +227,19 @@ export class TieredMonitor extends EventEmitter {
   }
 
   private updateCurveFromState(curve: TrackedCurve, state: BondingCurveState): void {
+    const now = Date.now();
+    const oldProgress = curve.progress;
+    curve.previousProgress = oldProgress;
     curve.state = state;
     curve.progress = calcProgress(state.realTokenReserves);
     curve.realSolSOL = Number(state.realSolReserves) / LAMPORTS_PER_SOL;
     curve.priceSOL = calcPricePerToken(state.virtualSolReserves, state.virtualTokenReserves);
     curve.marketCapSOL = calcMarketCapSOL(state.virtualSolReserves, state.virtualTokenReserves);
     curve.isKOTH = curve.realSolSOL >= KOTH_SOL_THRESHOLD;
-    curve.lastUpdated = Date.now();
+    curve.lastUpdated = now;
+    if (Math.abs(curve.progress - oldProgress) > 0.001) {
+      curve.lastProgressChangeAt = now;
+    }
   }
 
   // ─── Polling lifecycle ─────────────────────────────────────────────────────
@@ -192,23 +259,45 @@ export class TieredMonitor extends EventEmitter {
       void this.pollTier(this.hot);
     }, HOT_POLL_INTERVAL_MS);
 
-    console.log('🚀 [TieredMonitor] Started — Cold/Warm/Hot polling active');
+    this.evictionSweep = setInterval(() => {
+      try {
+        this.runEvictionSweep();
+      } catch {
+        /* silent */
+      }
+    }, EVICTION_SWEEP_MS);
+
+    console.log(
+      `🚀 [TieredMonitor] Started — polling + eviction sweep every ${EVICTION_SWEEP_MS / 1000}s`,
+    );
   }
 
   stop(): void {
     if (this.coldInterval) { clearInterval(this.coldInterval); this.coldInterval = null; }
     if (this.warmInterval) { clearInterval(this.warmInterval); this.warmInterval = null; }
     if (this.hotInterval)  { clearInterval(this.hotInterval);  this.hotInterval = null; }
+    if (this.evictionSweep) { clearInterval(this.evictionSweep); this.evictionSweep = null; }
     console.log('🛑 [TieredMonitor] Stopped');
   }
 
-  getStats(): { cold: number; warm: number; hot: number; total: number } {
+  getStats(): { cold: number; warm: number; hot: number; total: number; evictions: number } {
     return {
       cold: this.cold.size,
       warm: this.warm.size,
       hot: this.hot.size,
       total: this.cold.size + this.warm.size + this.hot.size,
+      evictions: this.evictionCount,
     };
+  }
+
+  /** Periodic pass over all tiers (Phase B — catches stalled curves between polls). */
+  private runEvictionSweep(): void {
+    const tiers = [this.cold, this.warm, this.hot] as const;
+    for (const tier of tiers) {
+      for (const [mint, curve] of tier) {
+        this.demoteOrEvict(mint, curve);
+      }
+    }
   }
 
   // ─── Internal helpers ──────────────────────────────────────────────────────
@@ -225,9 +314,29 @@ export class TieredMonitor extends EventEmitter {
 
   private enforceCapacity(tier: Map<string, TrackedCurve>, max: number): void {
     while (tier.size >= max) {
-      const oldest = tier.keys().next().value;
-      if (oldest === undefined) break;
-      this.evict(oldest, `capacity_${max}`);
+      const victim = this.findOldestEvictableMint(tier);
+      if (victim === undefined) break;
+      this.evict(victim, `capacity_${max}`);
     }
+  }
+
+  /** Never evict a mint with an open position (Phase B). */
+  private findOldestEvictableMint(tier: Map<string, TrackedCurve>): string | undefined {
+    let best: string | undefined;
+    let bestT = Infinity;
+    try {
+      const pm = getPositionManager();
+      for (const [mint, c] of tier) {
+        if (pm.hasOpenPosition(mint)) continue;
+        if (c.createdAt < bestT) {
+          bestT = c.createdAt;
+          best = mint;
+        }
+      }
+    } catch {
+      const first = tier.keys().next().value;
+      return first;
+    }
+    return best;
   }
 }

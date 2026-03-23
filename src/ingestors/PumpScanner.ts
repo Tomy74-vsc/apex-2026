@@ -2,6 +2,9 @@ import { Connection, PublicKey } from '@solana/web3.js';
 import { EventEmitter } from 'events';
 import { getMint } from '@solana/spl-token';
 import WS from 'ws';
+
+/** Payload `ws` `message` (aligné sur @types/ws sans dépendre de RawData exporté). */
+type WsMessagePayload = string | Buffer | ArrayBuffer | Buffer[];
 import type { MarketEvent, TokenMetadata } from '../types/index.js';
 import { getCurveTracker } from '../modules/curve-tracker/CurveTracker.js';
 import { KOTH_SOL_THRESHOLD } from '../constants/pumpfun.js';
@@ -156,7 +159,7 @@ export class PumpScanner extends EventEmitter {
         this.emit('connected');
       });
 
-      this.ws.on('message', (raw: WS.RawData) => {
+      this.ws.on('message', (raw: WsMessagePayload) => {
         try {
           this.lastEventTs = Date.now();
           const msg = JSON.parse(raw.toString());

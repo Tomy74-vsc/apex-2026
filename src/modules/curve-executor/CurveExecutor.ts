@@ -245,10 +245,10 @@ export class CurveExecutor {
       };
     }
 
-    // Jito tip instruction
-    const tipAccount = new PublicKey(
-      JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)],
-    );
+    // Jito tip instruction (noUncheckedIndexedAccess: arr[i] is string | undefined)
+    const tipIdx = Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length);
+    const tipPk = JITO_TIP_ACCOUNTS[tipIdx] ?? JITO_TIP_ACCOUNTS[0]!;
+    const tipAccount = new PublicKey(tipPk);
     const tipIx = SystemProgram.transfer({
       fromPubkey: this.payer.publicKey,
       toPubkey: tipAccount,

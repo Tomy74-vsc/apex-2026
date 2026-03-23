@@ -43,6 +43,17 @@ export interface TrackedCurve {
   tier: 'cold' | 'warm' | 'hot';
   tradeCount: number;
   metadata: { name?: string; symbol?: string; uri?: string };
+
+  /** Phase B: set when promoted to HOT (predictor min time-in-HOT gate). */
+  lastPromotedToHot?: number;
+  /** Last progress before the most recent on-chain update (eviction / stall heuristics). */
+  previousProgress?: number;
+  /** Last time |progress| moved more than ~0.1% (TieredMonitor maintenance). */
+  lastProgressChangeAt: number;
+  /** Wall-clock when curve entered HOT tier. */
+  hotSince?: number;
+  /** Progress snapshot at HOT entry (stall detection). */
+  progressAtHotEntry?: number;
 }
 
 /** Evenement de trade observe sur une bonding curve. */
@@ -84,9 +95,11 @@ export function decodeBondingCurve(data: Buffer): BondingCurveState {
   }
 
   for (let i = 0; i < DISC_LEN; i++) {
-    if (data[i] !== BONDING_CURVE_DISCRIMINATOR[i]) {
+    const got = data[i];
+    const want = BONDING_CURVE_DISCRIMINATOR[i];
+    if (got === undefined || want === undefined || got !== want) {
       throw new Error(
-        `Discriminateur invalide a l'index ${i}: 0x${data[i].toString(16)} != 0x${BONDING_CURVE_DISCRIMINATOR[i].toString(16)}`,
+        `Discriminateur invalide a l'index ${i}: 0x${(got ?? 0).toString(16)} != 0x${(want ?? 0).toString(16)}`,
       );
     }
   }

@@ -71,7 +71,7 @@ function displayState(
   console.log(`  📊 Real SOL          : ${fmtBig(state.realSolReserves)} (${fmt(realSol, 4)} SOL)`);
   console.log(`  ─────────────────────────────────────────────────`);
   console.log(`  📊 Progress          : ${fmt(progress * 100, 1)}%`);
-  console.log(`  💰 Prix actuel       : ${price.toExponential(6)} lamports/token`);
+  console.log(`  💰 Prix actuel       : ${price.toExponential(6)} SOL/raw unit`);
   console.log(`  💰 Market Cap        : ${fmt(mcap, 2)} SOL`);
   console.log(`  🏆 Completed         : ${state.complete}`);
   console.log(`  👤 Creator           : ${state.creator.toBase58()}`);

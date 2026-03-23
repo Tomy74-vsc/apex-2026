@@ -1,38 +1,55 @@
 import { VelocityAnalyzer, type VelocitySignal } from './VelocityAnalyzer.js';
 import { BotDetector, type BotSignal } from './BotDetector.js';
 import { WalletScorer, type WalletScore } from './WalletScorer.js';
-import { calcBreakeven } from './BreakevenCurve.js';
+import { calcBreakevenWithConfidence } from './BreakevenCurve.js';
 import type { CurveTradeEvent, TrackedCurve } from '../../types/bonding-curve.js';
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Weights (paper arXiv: Marino et al.)
+// APEX_QUANT_STRATEGY §5 — 7-signal weights (Marino + velocity momentum)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const W_VELOCITY = 0.40;
-const W_BOT_SAFETY = 0.20;
-const W_SMART_MONEY = 0.15;
-const W_HOLDER_DIVERSITY = 0.15;
-const W_SOCIAL = 0.10;
+const W_TRADING_INTENSITY = 0.35;
+const W_VELOCITY_MOMENTUM = 0.2;
+const W_ANTI_BOT = 0.15;
+const W_HOLDER = 0.1;
+const W_SMART_MONEY = 0.08;
+const W_SOCIAL = 0.07;
+const W_PROGRESS_SIGMOID = 0.05;
 
-// Normalization caps
-const VELOCITY_CAP_SOL_MIN = 10;    // 10 SOL/min → score 1.0
-const SMART_MONEY_CAP = 5;          // 5 smart money buyers → score 1.0
+// Heuristic fallback (no trades) — still progress/SOL/age shaped
+const W_HEURISTIC_PROGRESS = 0.55;
+const W_HEURISTIC_SOL = 0.3;
+const W_HEURISTIC_AGE = 0.15;
 
-// Stage 1 veto thresholds
-const VETO_AVG_TRADE_SIZE = 0.3;    // < 0.3 SOL average → not enough engagement
-const VETO_BOT_RATIO = 0.7;
-const VETO_VELOCITY_RATIO = 0.2;    // momentum dead
+function envFloat(key: string, def: number): number {
+  const v = process.env[key];
+  if (v === undefined || v === '') return def;
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : def;
+}
 
-// State-based heuristic weights (no trade data fallback)
-const W_HEURISTIC_PROGRESS = 0.55;  // progress sigmoid is the strongest signal
-const W_HEURISTIC_SOL = 0.30;       // real SOL deposited
-const W_HEURISTIC_AGE = 0.15;       // age decay (newer = faster momentum)
+function envInt(key: string, def: number): number {
+  const v = process.env[key];
+  if (v === undefined || v === '') return def;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : def;
+}
+
+const MIN_TRADING_INTENSITY = () => envFloat('MIN_TRADING_INTENSITY', 0.15);
+const VETO_BOT_RATIO = () => envFloat('VETO_BOT_RATIO', 0.7);
+const VETO_VELOCITY_RATIO = () => envFloat('VETO_VELOCITY_RATIO', 0.2);
+const CURVE_ENTRY_MIN_PROGRESS = () => envFloat('CURVE_ENTRY_MIN_PROGRESS', 0.45);
+const CURVE_ENTRY_MAX_PROGRESS = () => envFloat('CURVE_ENTRY_MAX_PROGRESS', 0.85);
+const VETO_MAX_AGE_MINUTES = () => envFloat('VETO_MAX_AGE_MINUTES', 45);
+const VETO_MIN_FRESH_PROGRESS = () => envFloat('VETO_MIN_FRESH_PROGRESS', 0.6);
+const MIN_TRADE_COUNT = () => envInt('MIN_TRADE_COUNT', 10);
+const MIN_MINUTES_IN_HOT = () => envFloat('MIN_MINUTES_IN_HOT', 2);
 
 const LAMPORTS_PER_SOL = 1_000_000_000;
 
 export interface PredictionResult {
-  pGrad: number;          // 0.0 – 1.0
-  confidence: number;     // 0.0 – 1.0
+  pGrad: number;
+  confidence: number;
   action: 'ENTER_CURVE' | 'SKIP';
   vetoReason: string | null;
   breakeven: number;
@@ -47,18 +64,20 @@ export class GraduationPredictor {
   private readonly velocityAnalyzer = new VelocityAnalyzer();
   private readonly botDetector = new BotDetector();
   private readonly walletScorer: WalletScorer;
+  private readonly vetoStats = new Map<string, number>();
 
   constructor(smartMoneyAddresses?: Set<string>) {
     this.walletScorer = new WalletScorer(smartMoneyAddresses);
   }
 
-  /**
-   * 2-stage prediction: fast heuristic veto, then weighted score.
-   *
-   * @param curve - Current tracked curve state
-   * @param trades - Trade history for this mint
-   * @param socialScore - Normalized social score from ViralityScorer (0-1), default 0
-   */
+  private bumpVeto(bucket: string): void {
+    this.vetoStats.set(bucket, (this.vetoStats.get(bucket) ?? 0) + 1);
+  }
+
+  getVetoStats(): Record<string, number> {
+    return Object.fromEntries(this.vetoStats);
+  }
+
   predict(
     curve: TrackedCurve,
     trades: CurveTradeEvent[],
@@ -71,32 +90,70 @@ export class GraduationPredictor {
     const walletScore = this.walletScorer.analyze(trades, curve.state.creator.toBase58());
 
     const realSolLamports = BigInt(Math.round(curve.realSolSOL * LAMPORTS_PER_SOL));
-    const { minPGrad, minPGradWithMargin } = calcBreakeven(realSolLamports);
-
     const buyCount = trades.filter((t) => t.isBuy).length;
 
-    // ─── No trade data → curve-state heuristic ──────────────────────
     if (buyCount === 0) {
       return this.predictFromCurveState(
-        curve, minPGrad, minPGradWithMargin, velocity, botSignal, walletScore, t0,
+        curve,
+        realSolLamports,
+        velocity,
+        botSignal,
+        walletScore,
+        t0,
       );
     }
 
-    // ─── Stage 1: Heuristic Veto (<1ms) ─────────────────────────────
-
+    // ─── APEX §5 V1–V5 (ordre strict) puis gates roadmapv3 ─────────────
     let vetoReason: string | null = null;
+    let vetoBucket: string | null = null;
 
-    if (velocity.avgTradeSize_SOL < VETO_AVG_TRADE_SIZE) {
-      vetoReason = `avgTradeSize ${velocity.avgTradeSize_SOL.toFixed(2)} < ${VETO_AVG_TRADE_SIZE}`;
-    } else if (botSignal.isVeto) {
-      vetoReason = `botRatio ${botSignal.botTransactionRatio.toFixed(2)} > ${VETO_BOT_RATIO}`;
-    } else if (walletScore.creatorIsSelling) {
+    const pMin = CURVE_ENTRY_MIN_PROGRESS();
+    const pMax = CURVE_ENTRY_MAX_PROGRESS();
+
+    if (walletScore.creatorIsSelling) {
       vetoReason = 'creator is selling (rug risk)';
-    } else if (velocity.velocityRatio < VETO_VELOCITY_RATIO && velocity.peakVelocity_5m > 0) {
-      vetoReason = `velocityRatio ${velocity.velocityRatio.toFixed(2)} < ${VETO_VELOCITY_RATIO}`;
+      vetoBucket = 'creator_selling';
+    } else if (botSignal.isVeto || botSignal.botTransactionRatio > VETO_BOT_RATIO()) {
+      vetoReason = `botRatio ${botSignal.botTransactionRatio.toFixed(2)} > ${VETO_BOT_RATIO()}`;
+      vetoBucket = 'bot_ratio';
+    } else if (velocity.avgTradeSize_SOL < MIN_TRADING_INTENSITY()) {
+      vetoReason = `tradingIntensity ${velocity.avgTradeSize_SOL.toFixed(3)} < ${MIN_TRADING_INTENSITY()}`;
+      vetoBucket = 'low_intensity';
+    } else if (curve.progress < pMin || curve.progress > pMax) {
+      vetoReason = `progress ${(curve.progress * 100).toFixed(1)}% outside [${(pMin * 100).toFixed(0)}%,${(pMax * 100).toFixed(0)}%]`;
+      vetoBucket = 'progress_band';
+    } else {
+      const ageMinutes = (Date.now() - curve.createdAt) / 60_000;
+      if (ageMinutes > VETO_MAX_AGE_MINUTES() && curve.progress < VETO_MIN_FRESH_PROGRESS()) {
+        vetoReason = `stale_age: ${ageMinutes.toFixed(0)}min & progress < ${(VETO_MIN_FRESH_PROGRESS() * 100).toFixed(0)}%`;
+        vetoBucket = 'stale_age';
+      }
     }
 
-    if (vetoReason) {
+    if (!vetoReason && buyCount < MIN_TRADE_COUNT()) {
+      vetoReason = `insufficient_trades: ${buyCount} < ${MIN_TRADE_COUNT()}`;
+      vetoBucket = 'min_trades';
+    }
+
+    if (!vetoReason && curve.lastPromotedToHot !== undefined) {
+      const minutesInHot = (Date.now() - curve.lastPromotedToHot) / 60_000;
+      if (minutesInHot < MIN_MINUTES_IN_HOT()) {
+        vetoReason = `too_early_in_hot: ${minutesInHot.toFixed(2)}min < ${MIN_MINUTES_IN_HOT()}min`;
+        vetoBucket = 'early_hot';
+      }
+    }
+
+    if (!vetoReason && velocity.velocityRatio < VETO_VELOCITY_RATIO() && velocity.peakVelocity_5m > 0) {
+      vetoReason = `velocityRatio ${velocity.velocityRatio.toFixed(2)} < ${VETO_VELOCITY_RATIO()}`;
+      vetoBucket = 'velocity_ratio';
+    }
+
+    const dataConfidence = Math.min(1, buyCount / 30);
+    const confidence = 0.3 + 0.7 * dataConfidence;
+    const { minPGrad, minPGradWithMargin } = calcBreakevenWithConfidence(realSolLamports, confidence);
+
+    if (vetoReason && vetoBucket) {
+      this.bumpVeto(vetoBucket);
       return {
         pGrad: 0,
         confidence: 0.9,
@@ -111,32 +168,42 @@ export class GraduationPredictor {
       };
     }
 
-    // ─── Stage 2: Weighted Score (future ML replacement) ─────────────
-
-    const velocityScore = Math.min(1, velocity.solPerMinute_1m / VELOCITY_CAP_SOL_MIN);
-    const botSafetyScore = 1 - botSignal.botTransactionRatio;
-    const smartMoneyScore = Math.min(1, walletScore.smartMoneyBuyerCount / SMART_MONEY_CAP);
-    const holderDiversityScore = 1 - walletScore.freshWalletRatio;
+    const tradingIntensityScore = Math.min(1, velocity.avgTradeSize_SOL / 1.0);
+    const velocityMomentumScore =
+      Math.min(1, velocity.solPerMinute_1m / 3.0) * Math.max(0, Math.min(1, velocity.velocityRatio));
+    const antiBotScore = 1 - botSignal.botTransactionRatio;
+    // APEX §5 holder quality: (1 − fresh) × (1 − top10 concentration proxy)
+    const holderScore = Math.max(
+      0,
+      Math.min(
+        1,
+        (1 - walletScore.freshWalletRatio) * (1 - walletScore.top10BuyVolumeShare),
+      ),
+    );
+    const smartMoneyScore = Math.min(1, walletScore.smartMoneyBuyerCount / 3);
     const socialNorm = Math.max(0, Math.min(1, socialScore));
+    const progressSigmoid = 1 / (1 + Math.exp(-12 * (curve.progress - 0.55)));
 
     const pGrad =
-      W_VELOCITY * velocityScore +
-      W_BOT_SAFETY * botSafetyScore +
+      W_TRADING_INTENSITY * tradingIntensityScore +
+      W_VELOCITY_MOMENTUM * velocityMomentumScore +
+      W_ANTI_BOT * antiBotScore +
+      W_HOLDER * holderScore +
       W_SMART_MONEY * smartMoneyScore +
-      W_HOLDER_DIVERSITY * holderDiversityScore +
-      W_SOCIAL * socialNorm;
-
-    const dataConfidence = Math.min(1, buyCount / 30);
-    const confidence = 0.3 + 0.7 * dataConfidence;
+      W_SOCIAL * socialNorm +
+      W_PROGRESS_SIGMOID * progressSigmoid;
 
     const safetyMarginMet = pGrad > minPGradWithMargin;
     const action = safetyMarginMet ? 'ENTER_CURVE' : 'SKIP';
-
     const latencyMs = performance.now() - t0;
+
+    if (!safetyMarginMet) {
+      this.bumpVeto('below_breakeven_margin');
+    }
 
     if (action === 'ENTER_CURVE') {
       console.log(
-        `🎯 [GradPredictor] ${curve.mint.slice(0, 8)} pGrad=${(pGrad * 100).toFixed(1)}% > breakeven=${(minPGradWithMargin * 100).toFixed(1)}% → ENTER (${latencyMs.toFixed(2)}ms)`,
+        `🎯 [GradPredictor] ${curve.mint.slice(0, 8)} pGrad=${(pGrad * 100).toFixed(1)}% > thresh=${(minPGradWithMargin * 100).toFixed(1)}% → ENTER (${latencyMs.toFixed(2)}ms)`,
       );
     }
 
@@ -144,7 +211,7 @@ export class GraduationPredictor {
       pGrad,
       confidence,
       action,
-      vetoReason: null,
+      vetoReason: safetyMarginMet ? null : `pGrad ${(pGrad * 100).toFixed(1)}% ≤ ${(minPGradWithMargin * 100).toFixed(1)}%`,
       breakeven: minPGrad,
       safetyMarginMet,
       velocity,
@@ -154,28 +221,71 @@ export class GraduationPredictor {
     };
   }
 
-  /**
-   * State-based heuristic when no trade microstructure data is available.
-   * Uses progress sigmoid + SOL reserves + age decay to estimate pGrad.
-   * Confidence is capped low (0.35) to reflect data poverty.
-   */
   private predictFromCurveState(
     curve: TrackedCurve,
-    minPGrad: number,
-    minPGradWithMargin: number,
+    realSolLamports: bigint,
     velocity: VelocitySignal,
     botSignal: BotSignal,
     walletScore: WalletScore,
     t0: number,
   ): PredictionResult {
-    // Sigmoid mapping: progress → graduation likelihood
-    // steepness=8, midpoint=0.50 → 30%≈0.17, 50%=0.50, 70%≈0.83, 85%≈0.94
-    const progressScore = 1 / (1 + Math.exp(-8 * (curve.progress - 0.50)));
+    /** APEX_QUANT_STRATEGY §6 — heuristique ~0.35 ⇒ safety_margin ≈ 1.52× */
+    const confidence = 0.35;
+    const { minPGrad, minPGradWithMargin } = calcBreakevenWithConfidence(realSolLamports, confidence);
 
-    // SOL deposited signals real market interest (cap at 50 SOL)
+    const pMin = CURVE_ENTRY_MIN_PROGRESS();
+    const pMax = CURVE_ENTRY_MAX_PROGRESS();
+    if (curve.progress < pMin || curve.progress > pMax) {
+      this.bumpVeto('heuristic_progress_band');
+      return {
+        pGrad: 0,
+        confidence,
+        action: 'SKIP',
+        vetoReason: `heuristic progress outside [${(pMin * 100).toFixed(0)}%,${(pMax * 100).toFixed(0)}%]`,
+        breakeven: minPGrad,
+        safetyMarginMet: false,
+        velocity,
+        botSignal,
+        walletScore,
+        latencyMs: performance.now() - t0,
+      };
+    }
+
+    if (walletScore.creatorIsSelling) {
+      this.bumpVeto('creator_selling');
+      return {
+        pGrad: 0,
+        confidence,
+        action: 'SKIP',
+        vetoReason: 'creator is selling (rug risk)',
+        breakeven: minPGrad,
+        safetyMarginMet: false,
+        velocity,
+        botSignal,
+        walletScore,
+        latencyMs: performance.now() - t0,
+      };
+    }
+
+    const ageMinHeur = (Date.now() - curve.createdAt) / 60_000;
+    if (ageMinHeur > VETO_MAX_AGE_MINUTES() && curve.progress < VETO_MIN_FRESH_PROGRESS()) {
+      this.bumpVeto('heuristic_stale_age');
+      return {
+        pGrad: 0,
+        confidence,
+        action: 'SKIP',
+        vetoReason: `stale_age: ${ageMinHeur.toFixed(0)}min & progress < ${(VETO_MIN_FRESH_PROGRESS() * 100).toFixed(0)}%`,
+        breakeven: minPGrad,
+        safetyMarginMet: false,
+        velocity,
+        botSignal,
+        walletScore,
+        latencyMs: performance.now() - t0,
+      };
+    }
+
+    const progressScore = 1 / (1 + Math.exp(-8 * (curve.progress - 0.5)));
     const solScore = Math.min(1, curve.realSolSOL / 50);
-
-    // Age decay: newer curves at same progress = faster momentum
     const ageMinutes = (Date.now() - curve.createdAt) / 60_000;
     const ageDecay = Math.max(0, 1 - ageMinutes / 120);
 
@@ -184,16 +294,17 @@ export class GraduationPredictor {
       W_HEURISTIC_SOL * solScore +
       W_HEURISTIC_AGE * ageDecay;
 
-    const confidence = 0.35;
-
     const safetyMarginMet = pGrad > minPGradWithMargin;
     const action = safetyMarginMet ? 'ENTER_CURVE' : 'SKIP';
-
     const latencyMs = performance.now() - t0;
+
+    if (!safetyMarginMet) {
+      this.bumpVeto('heuristic_below_margin');
+    }
 
     if (action === 'ENTER_CURVE') {
       console.log(
-        `🎯 [GradPredictor:State] ${curve.mint.slice(0, 8)} pGrad=${(pGrad * 100).toFixed(1)}% > breakeven=${(minPGradWithMargin * 100).toFixed(1)}% → ENTER (heuristic, ${latencyMs.toFixed(2)}ms)`,
+        `🎯 [GradPredictor:State] ${curve.mint.slice(0, 8)} pGrad=${(pGrad * 100).toFixed(1)}% > thresh=${(minPGradWithMargin * 100).toFixed(1)}% → ENTER (${latencyMs.toFixed(2)}ms)`,
       );
     }
 
@@ -201,7 +312,7 @@ export class GraduationPredictor {
       pGrad,
       confidence,
       action,
-      vetoReason: null,
+      vetoReason: safetyMarginMet ? null : `heuristic pGrad ≤ margin`,
       breakeven: minPGrad,
       safetyMarginMet,
       velocity,
@@ -211,17 +322,14 @@ export class GraduationPredictor {
     };
   }
 
-  /** Forward to WalletScorer for creator outcome tracking. */
   recordCreatorOutcome(creator: string, graduated: boolean): void {
     this.walletScorer.recordCreatorOutcome(creator, graduated);
   }
 
-  /** Forward to WalletScorer. */
   setSmartMoneyList(addresses: string[]): void {
     this.walletScorer.setSmartMoneyList(addresses);
   }
 
-  /** Purge per-mint state. */
   clear(mint: string): void {
     this.velocityAnalyzer.clear(mint);
   }

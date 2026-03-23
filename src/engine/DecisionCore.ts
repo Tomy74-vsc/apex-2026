@@ -17,6 +17,8 @@ import type {
   CurveSnapshotRecord,
 } from '../types/index.js';
 import type { TrackedCurve, CurveTradeEvent } from '../types/bonding-curve.js';
+import { evaluateEntryGates } from '../modules/entry/EntryFilter.js';
+import { getCurveVelocityAnalyzer } from '../modules/position/curveVelocitySingleton.js';
 
 /**
  * Événements émis par le DecisionCore
@@ -58,6 +60,7 @@ export class DecisionCore extends EventEmitter {
   private curvesEvaluated: number = 0;
   private curvesEntered: number = 0;
   private curvesSkippedCooldown: number = 0;
+  private entryGateRejected: number = 0;
   private activeCurvePositions: number = 0;
   private readonly curveCooldowns: Map<string, number> = new Map();
   private readonly curveLoggedEnter: Set<string> = new Set();
@@ -188,6 +191,16 @@ export class DecisionCore extends EventEmitter {
         return null;
       }
 
+      const vel = getCurveVelocityAnalyzer().analyze(curve.mint, trades);
+      const gate = evaluateEntryGates(curve, trades, vel);
+      if (!gate.ok) {
+        this.entryGateRejected++;
+        console.log(
+          `🚧 [DecisionCore:EntryFilter] ${curve.mint.slice(0, 8)}… ${gate.failedGate}: ${gate.detail}`,
+        );
+        return null;
+      }
+
       const brain = getAIBrain();
       const decision = brain.decideCurve(curve, trades);
 
@@ -247,6 +260,11 @@ export class DecisionCore extends EventEmitter {
   /** Called by app.ts when a curve position is opened/closed. */
   updateActivePositions(delta: number): void {
     this.activeCurvePositions = Math.max(0, this.activeCurvePositions + delta);
+  }
+
+  /** Align slot counter after restoring PositionManager from SQLite (curve-prediction). */
+  syncActiveCurveSlotCount(openCount: number): void {
+    this.activeCurvePositions = Math.max(0, Math.floor(openCount));
   }
 
   /**
@@ -537,6 +555,7 @@ export class DecisionCore extends EventEmitter {
     curvesEvaluated: number;
     curvesEntered: number;
     curvesSkippedCooldown: number;
+    entryGateRejected: number;
     activeCurvePositions: number;
   } {
     return {
@@ -549,6 +568,7 @@ export class DecisionCore extends EventEmitter {
       curvesEvaluated: this.curvesEvaluated,
       curvesEntered: this.curvesEntered,
       curvesSkippedCooldown: this.curvesSkippedCooldown,
+      entryGateRejected: this.entryGateRejected,
       activeCurvePositions: this.activeCurvePositions,
     };
   }

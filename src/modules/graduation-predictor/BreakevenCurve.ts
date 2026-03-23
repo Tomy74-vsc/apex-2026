@@ -2,10 +2,7 @@ import {
   INITIAL_VIRTUAL_SOL_RESERVES,
   FEE_BASIS_POINTS,
 } from '../../constants/pumpfun.js';
-import {
-  calcPricePerToken,
-  calcExpectedReturnOnGraduation,
-} from '../../math/curve-math.js';
+import { calcExpectedReturnOnGraduation } from '../../math/curve-math.js';
 
 const LAMPORTS_PER_SOL = 1_000_000_000n;
 const BPS_BASE = 10_000n;
@@ -25,6 +22,30 @@ export interface BreakevenResult {
   expectedReturn: number;
   roundTripFeePct: number;
   entryRealSol: number;
+}
+
+/**
+ * APEX_QUANT_STRATEGY §6 — higher margin when confidence in p̂ is low.
+ * safety_margin(c) = 1 + (1 − c) × 0.8
+ */
+export function safetyMarginFromConfidence(confidence: number): number {
+  const c = Math.max(0, Math.min(1, confidence));
+  return 1 + (1 - c) * 0.8;
+}
+
+/**
+ * Breakeven threshold with dynamic margin (no fixed 1.2×).
+ */
+export function calcBreakevenWithConfidence(
+  realSolLamports: bigint,
+  confidence: number,
+): BreakevenResult {
+  const base = calcBreakeven(realSolLamports, 1);
+  const mult = safetyMarginFromConfidence(confidence);
+  return {
+    ...base,
+    minPGradWithMargin: Math.min(1, base.minPGrad * mult),
+  };
 }
 
 /**

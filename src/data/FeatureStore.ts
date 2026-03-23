@@ -203,6 +203,13 @@ CREATE TABLE IF NOT EXISTS curve_outcomes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_curve_outcomes_graduated ON curve_outcomes(graduated);
+
+-- V3.1 Phase A — Open curve positions (crash recovery, debounced upserts from PositionManager)
+CREATE TABLE IF NOT EXISTS open_curve_positions (
+  mint          TEXT    PRIMARY KEY,
+  payload_json  TEXT    NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
 `;
 
 // ─── Classe principale ────────────────────────────────────────────────────────
@@ -759,6 +766,42 @@ export class FeatureStore {
       return row ?? { total: 0, graduated: 0, evicted: 0 };
     } catch {
       return { total: 0, graduated: 0, evicted: 0 };
+    }
+  }
+
+  /** Persist one open curve position (PositionManager debounced / shutdown flush). */
+  upsertOpenCurvePosition(mint: string, payloadJson: string): void {
+    if (this.isClosed) return;
+    try {
+      this.db
+        .prepare(
+          `INSERT OR REPLACE INTO open_curve_positions (mint, payload_json, updated_at) VALUES (?, ?, ?)`,
+        )
+        .run(mint, payloadJson, Date.now());
+    } catch (err) {
+      this.stats.errors += 1;
+      console.warn(`⚠️  [FeatureStore] upsertOpenCurvePosition error: ${err}`);
+    }
+  }
+
+  deleteOpenCurvePosition(mint: string): void {
+    if (this.isClosed) return;
+    try {
+      this.db.prepare(`DELETE FROM open_curve_positions WHERE mint = ?`).run(mint);
+    } catch (err) {
+      this.stats.errors += 1;
+      console.warn(`⚠️  [FeatureStore] deleteOpenCurvePosition error: ${err}`);
+    }
+  }
+
+  loadOpenCurvePositions(): Array<{ mint: string; payload_json: string }> {
+    try {
+      return this.db
+        .prepare(`SELECT mint, payload_json FROM open_curve_positions`)
+        .all() as Array<{ mint: string; payload_json: string }>;
+    } catch (err) {
+      console.warn(`⚠️  [FeatureStore] loadOpenCurvePositions error: ${err}`);
+      return [];
     }
   }
 

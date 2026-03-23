@@ -29,6 +29,7 @@ import {
   deriveAssociatedBondingCurve,
 } from '../../types/bonding-curve.js';
 import { calcBuyOutput, calcSellOutput } from '../../math/curve-math.js';
+import { defaultJitoHttpTimeoutMs, fetchWithTimeout } from '../../infra/fetchWithTimeout.js';
 
 const JITO_TIP_ACCOUNTS = [
   '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5',
@@ -288,17 +289,20 @@ export class CurveExecutor {
 
     // Submit to Jito bundle API
     try {
-      const resp = await fetch(`${this.jitoBlockEngineUrl}/api/v1/bundles`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'sendBundle',
-          params: [[serialized]],
-        }),
-        signal: AbortSignal.timeout(5_000),
-      });
+      const resp = await fetchWithTimeout(
+        `${this.jitoBlockEngineUrl}/api/v1/bundles`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'sendBundle',
+            params: [[serialized]],
+          }),
+        },
+        defaultJitoHttpTimeoutMs(),
+      );
 
       const json = await resp.json() as { result?: string; error?: { message: string } };
       if (json.error) {

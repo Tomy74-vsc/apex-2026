@@ -5,6 +5,7 @@
  */
 
 import { XAI_RESPONSES_WEB_TOOLS } from './xai-live-search.js';
+import { fetchWithTimeout } from '../infra/fetchWithTimeout.js';
 
 function responsesTimeoutMs(): number {
   const v = process.env.XAI_RESPONSES_TIMEOUT_MS ?? process.env.GROK_X_FETCH_TIMEOUT_MS;
@@ -74,30 +75,33 @@ export class GrokXScanner {
 
     const t0 = performance.now();
     try {
-      const response = await fetch(`${this.baseUrl}/responses`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json',
+      const response = await fetchWithTimeout(
+        `${this.baseUrl}/responses`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: this.model,
+            tools: XAI_RESPONSES_WEB_TOOLS,
+            input: [
+              {
+                role: 'system',
+                content:
+                  'You are a crypto social media analyst. Analyze X/Twitter activity for the given Solana memecoin. Focus on: mention velocity (growing/stable/dying), organic vs bot hype, influencer involvement, narrative strength. Be skeptical of coordinated shilling. Return ONLY the JSON object requested.',
+              },
+              {
+                role: 'user',
+                content: `Analyze current X/Twitter buzz for Solana token $${ticker} (address: ${mintAddress.slice(0, 16)}…) in the last 30 minutes. Return ONLY JSON: {"mentionCount":0,"sentiment":0,"hypeLevel":0,"botActivity":0,"influencerMentions":0,"keyThemes":[],"confidence":0}`,
+              },
+            ],
+            max_output_tokens: 1024,
+          }),
         },
-        body: JSON.stringify({
-          model: this.model,
-          tools: XAI_RESPONSES_WEB_TOOLS,
-          input: [
-            {
-              role: 'system',
-              content:
-                'You are a crypto social media analyst. Analyze X/Twitter activity for the given Solana memecoin. Focus on: mention velocity (growing/stable/dying), organic vs bot hype, influencer involvement, narrative strength. Be skeptical of coordinated shilling. Return ONLY the JSON object requested.',
-            },
-            {
-              role: 'user',
-              content: `Analyze current X/Twitter buzz for Solana token $${ticker} (address: ${mintAddress.slice(0, 16)}…) in the last 30 minutes. Return ONLY JSON: {"mentionCount":0,"sentiment":0,"hypeLevel":0,"botActivity":0,"influencerMentions":0,"keyThemes":[],"confidence":0}`,
-            },
-          ],
-          max_output_tokens: 1024,
-        }),
-        signal: AbortSignal.timeout(responsesTimeoutMs()),
-      });
+        responsesTimeoutMs(),
+      );
 
       const rawBody = await response.text();
       if (!response.ok) {

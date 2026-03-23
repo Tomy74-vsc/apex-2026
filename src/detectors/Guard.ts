@@ -7,6 +7,7 @@ import {
   readCurveEntryMaxProgress,
   readCurveEntryMinProgress,
 } from '../constants/curve-entry-bands.js';
+import { defaultDexScreenerTimeoutMs, fetchWithTimeout } from '../infra/fetchWithTimeout.js';
 
 export interface CurveGuardResult {
   allowed: boolean;
@@ -530,9 +531,10 @@ export class Guard {
       const mint = mintPubkey.toBase58();
       const t0Liq = performance.now();
 
-      const resp = await fetch(
+      const resp = await fetchWithTimeout(
         `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
-        { signal: AbortSignal.timeout(3_000) },
+        {},
+        defaultDexScreenerTimeoutMs(),
       );
 
       if (!resp.ok) {
@@ -631,6 +633,61 @@ export class Guard {
     }
 
     return { allowed, flags };
+  }
+
+  /**
+   * Courbe : garde synchrone puis, en live + CURVE_FULL_GUARD=1, `analyzeToken` avec timeout.
+   * Paper / flag off : équivalent `validateCurve` uniquement (pas de latence Jupiter/Raydium).
+   */
+  async validateCurveForExecution(
+    curve: TrackedCurve,
+    activePositions: number,
+  ): Promise<CurveGuardResult> {
+    const sync = this.validateCurve(curve, activePositions);
+    if (!sync.allowed) {
+      return sync;
+    }
+
+    const full = (process.env.CURVE_FULL_GUARD ?? '').trim() === '1';
+    const live =
+      (process.env.TRADING_MODE ?? '').trim() === 'live' &&
+      (process.env.TRADING_ENABLED ?? '').trim() === 'true';
+    if (!full || !live) {
+      return sync;
+    }
+
+    const timeoutMs = parseInt(process.env.CURVE_GUARD_TOKEN_TIMEOUT_MS ?? '12000', 10) || 12_000;
+    const maxRisk = parseInt(process.env.MAX_RISK_SCORE ?? '50', 10) || 50;
+    const mint = curve.mint;
+
+    try {
+      const security = await Promise.race([
+        this.analyzeToken(mint),
+        new Promise<SecurityReport>((_, rej) => {
+          setTimeout(() => rej(new Error('CURVE_GUARD_TOKEN_TIMEOUT')), timeoutMs);
+        }),
+      ]);
+
+      if (!security.isSafe || security.riskScore > maxRisk) {
+        const flags = [
+          ...sync.flags,
+          `TOKEN_ANALYSIS:unsafe_or_risk`,
+          `riskScore=${security.riskScore}`,
+          ...security.flags.map((f) => `tok:${f}`),
+        ];
+        console.log(`🛡️ [Guard:Curve+Token] ${mint.slice(0, 8)} BLOCKED after full token check`);
+        return { allowed: false, flags };
+      }
+
+      return sync;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn(`⚠️  [Guard:Curve+Token] ${mint.slice(0, 8)} ${msg.slice(0, 80)}`);
+      return {
+        allowed: false,
+        flags: [...sync.flags, `TOKEN_GUARD_FAIL:${msg.slice(0, 60)}`],
+      };
+    }
   }
 
   /**

@@ -7,6 +7,7 @@
 import type { TelegramClient } from 'telegram';
 import type { EntityLike } from 'telegram/define.js';
 import { getNLPPipeline } from '../nlp/NLPPipeline.js';
+import { envHttpTimeoutMs, fetchWithTimeout } from '../infra/fetchWithTimeout.js';
 
 const DEX_TOKEN_URL = 'https://api.dexscreener.com/latest/dex/tokens';
 const DEX_TIMEOUT_MS = 3_000;
@@ -108,7 +109,7 @@ async function fetchDexTokenContext(mint: string): Promise<{
 async function discoverTelegramUrlFromMetadataUri(uri: string | undefined): Promise<string | null> {
   if (!uri || !uri.startsWith('http')) return null;
   try {
-    const resp = await fetch(uri, { signal: AbortSignal.timeout(META_TIMEOUT_MS) });
+    const resp = await fetchWithTimeout(uri, {}, envHttpTimeoutMs('HTTP_METADATA_TIMEOUT_MS', META_TIMEOUT_MS));
     if (!resp.ok) return null;
     const text = await resp.text();
     const m = text.match(/https?:\/\/(?:t\.me|telegram\.me)\/[a-zA-Z0-9_+/]+/i);

@@ -147,7 +147,7 @@ Key envs: `CURVE_ENTRY_MIN_PROGRESS` / `CURVE_ENTRY_MAX_PROGRESS`, `MIN_TRADING_
 9. `SocialTrendScanner.ts` + `app.ts` wiring (DexScreener + PumpPortal).  
 10. `DexScreenerMonitor.ts` (if not folded into 9) + events for scoring.  
 11. `TelegramTokenScanner.ts` (GramJS + DexScreener discovery) → cache → `socialScore` into predictor (APEX social blend).  
-12. `WhaleWalletDB.ts` + FeatureStore table + `scripts/discover-whales.ts` + boot `loadIntoSmartMoneyTracker()`.  
+12. `WhaleWalletDB.ts` + FeatureStore table + `scripts/discover-whales.ts` (alias de `seed-whales.ts` ; `bun run discover:whales` / `seed:whales`) + boot `loadIntoSmartMoneyTracker()`.  
 13. **Optional:** `src/social/GrokXScanner.ts` + `SentimentAggregator.ts` (xAI credits) — **cold path / overlay only**, never sole trigger.
 
 **Phase E — ML flywheel (v4 P3 + roadmap.md Phase 3)**  

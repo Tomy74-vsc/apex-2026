@@ -110,7 +110,11 @@ export class CurveTracker extends EventEmitter {
 
     const curve = this.getCurveState(event.mint);
     if (curve) {
-      curve.tradeCount++;
+      if (event.synthetic) {
+        curve.syntheticFlowEventCount = (curve.syntheticFlowEventCount ?? 0) + 1;
+      } else if (event.isBuy) {
+        curve.tradeCount += 1;
+      }
     }
   }
 

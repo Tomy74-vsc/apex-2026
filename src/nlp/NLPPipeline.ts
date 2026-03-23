@@ -13,6 +13,7 @@ import { EventEmitter } from 'events';
 import { processStage0, type Stage0Result } from './Stage0_Regex.js';
 import { getStage1Groq, type Stage1Result } from './Stage1_Groq.js';
 import { getViralityScorer, type MentionEvent } from './ViralityScorer.js';
+import { envHttpTimeoutMs, fetchWithTimeout } from '../infra/fetchWithTimeout.js';
 
 export interface NLPSignal {
   mint: string;
@@ -130,26 +131,29 @@ export class NLPPipeline extends EventEmitter {
       const apiKey = process.env.GROQ_API_KEY;
       if (!apiKey) return { sentiment: s1.sentiment, confidence: s1.confidence, category: s1.category };
 
-      const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
+      const resp = await fetchWithTimeout(
+        'https://api.groq.com/openai/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model: 'llama-3.3-70b-versatile',
+            messages: [
+              {
+                role: 'system',
+                content: `You are an expert crypto market analyst. Stage 1 classified this text as ${s1.category} with sentiment=${s1.sentiment} and confidence=${s1.confidence}. Re-analyze with deeper reasoning. Respond ONLY with JSON: {"sentiment": <-1 to 1>, "confidence": <0 to 1>, "category": "<BULLISH|BEARISH|NEUTRAL|SPAM>"}`,
+              },
+              { role: 'user', content: text.slice(0, 1000) },
+            ],
+            max_tokens: 150,
+            temperature: 0.1,
+          }),
         },
-        body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
-          messages: [
-            {
-              role: 'system',
-              content: `You are an expert crypto market analyst. Stage 1 classified this text as ${s1.category} with sentiment=${s1.sentiment} and confidence=${s1.confidence}. Re-analyze with deeper reasoning. Respond ONLY with JSON: {"sentiment": <-1 to 1>, "confidence": <0 to 1>, "category": "<BULLISH|BEARISH|NEUTRAL|SPAM>"}`,
-            },
-            { role: 'user', content: text.slice(0, 1000) },
-          ],
-          max_tokens: 150,
-          temperature: 0.1,
-        }),
-        signal: AbortSignal.timeout(5_000),
-      });
+        envHttpTimeoutMs('HTTP_GROQ_TIMEOUT_MS', 5_000),
+      );
 
       if (!resp.ok) return { sentiment: s1.sentiment, confidence: s1.confidence, category: s1.category };
 

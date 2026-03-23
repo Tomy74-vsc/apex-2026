@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
- * Bootstrap whale_wallets avec des adresses smart-money connues.
- * Usage: bun scripts/seed-whales.ts
+ * Alias roadmapv3 `discover-whales.ts` — même comportement que `seed-whales.ts`.
+ * Usage: bun scripts/discover-whales.ts
  */
 
 import { DEFAULT_KNOWN_WHALES, runWhaleSeed } from './lib/whale-seed.js';

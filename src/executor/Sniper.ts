@@ -8,6 +8,7 @@ import {
 } from '@solana/web3.js';
 import bs58 from 'bs58';
 import type { ExecutionBundle, ScoredToken } from '../types/index.js';
+import { defaultJupiterUltraTimeoutMs, fetchWithTimeout } from '../infra/fetchWithTimeout.js';
 
 interface UltraOrderRequest {
   inputMint: string;
@@ -263,12 +264,15 @@ export class Sniper {
         requestId,
       };
 
-      const resp = await fetch(`${this.ultraApiUrl}/execute`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(10_000),
-      });
+      const resp = await fetchWithTimeout(
+        `${this.ultraApiUrl}/execute`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+        defaultJupiterUltraTimeoutMs('execute'),
+      );
 
       if (!resp.ok) {
         console.error(
@@ -429,9 +433,11 @@ export class Sniper {
     warnings: string[];
   }> {
     try {
-      const resp = await fetch(`${this.ultraApiUrl}/shield?mints=${mint}`, {
-        signal: AbortSignal.timeout(3_000),
-      });
+      const resp = await fetchWithTimeout(
+        `${this.ultraApiUrl}/shield?mints=${mint}`,
+        {},
+        defaultJupiterUltraTimeoutMs('shield'),
+      );
       if (!resp.ok) return { safe: true, warnings: [] };
 
       const data = (await resp.json()) as {

@@ -178,6 +178,11 @@ CREATE TABLE IF NOT EXISTS curve_snapshots (
 
   social_score          REAL    NOT NULL DEFAULT 0,
 
+  synthetic_flow_count   INTEGER NOT NULL DEFAULT 0,
+  sol_per_minute_1m_mixed  REAL NOT NULL DEFAULT 0,
+  sol_per_minute_5m_mixed  REAL NOT NULL DEFAULT 0,
+  avg_trade_size_sol_mixed REAL NOT NULL DEFAULT 0,
+
   -- Latency
   prediction_ms         REAL    NOT NULL DEFAULT 0,
   created_at            INTEGER NOT NULL
@@ -261,6 +266,7 @@ export class FeatureStore {
     this.db.run('PRAGMA synchronous = NORMAL');
     this.db.run(SCHEMA);
     this.migrateCurveSnapshotsSocialScore();
+    this.migrateCurveSnapshotsMlV2();
 
     this.flushTimer = setInterval(() => {
       this.flush().catch(() => {});
@@ -281,6 +287,44 @@ export class FeatureStore {
       if (!cols.some((c) => c.name === 'social_score')) {
         this.db.run('ALTER TABLE curve_snapshots ADD COLUMN social_score REAL NOT NULL DEFAULT 0');
         console.log('✅ [FeatureStore] Migration curve_snapshots.social_score');
+      }
+    } catch {
+      /* cold path */
+    }
+  }
+
+  /** Colonnes ML : flux synthétique vs wallet + vélocité mixte (A/B). */
+  private migrateCurveSnapshotsMlV2(): void {
+    try {
+      const cols = this.db.prepare('PRAGMA table_info(curve_snapshots)').all() as Array<{ name: string }>;
+      const names = new Set(cols.map((c) => c.name));
+      let added = false;
+      const add = (sql: string, label: string) => {
+        if (!names.has(label)) {
+          this.db.run(sql);
+          names.add(label);
+          added = true;
+          console.log(`✅ [FeatureStore] Migration curve_snapshots.${label}`);
+        }
+      };
+      add(
+        'ALTER TABLE curve_snapshots ADD COLUMN synthetic_flow_count INTEGER NOT NULL DEFAULT 0',
+        'synthetic_flow_count',
+      );
+      add(
+        'ALTER TABLE curve_snapshots ADD COLUMN sol_per_minute_1m_mixed REAL NOT NULL DEFAULT 0',
+        'sol_per_minute_1m_mixed',
+      );
+      add(
+        'ALTER TABLE curve_snapshots ADD COLUMN sol_per_minute_5m_mixed REAL NOT NULL DEFAULT 0',
+        'sol_per_minute_5m_mixed',
+      );
+      add(
+        'ALTER TABLE curve_snapshots ADD COLUMN avg_trade_size_sol_mixed REAL NOT NULL DEFAULT 0',
+        'avg_trade_size_sol_mixed',
+      );
+      if (added) {
+        this.curveSnapshotInsertStmt = null;
       }
     } catch {
       /* cold path */
@@ -634,8 +678,9 @@ export class FeatureStore {
           sol_per_minute_1m, sol_per_minute_5m, avg_trade_size_sol, velocity_ratio,
           bot_transaction_ratio, smart_money_buyer_cnt, creator_is_selling, fresh_wallet_ratio,
           social_score,
+          synthetic_flow_count, sol_per_minute_1m_mixed, sol_per_minute_5m_mixed, avg_trade_size_sol_mixed,
           prediction_ms, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       }
       this.curveSnapshotInsertStmt.run(
@@ -645,6 +690,10 @@ export class FeatureStore {
         snap.solPerMinute1m, snap.solPerMinute5m, snap.avgTradeSizeSOL, snap.velocityRatio,
         snap.botTransactionRatio, snap.smartMoneyBuyerCount, snap.creatorIsSelling, snap.freshWalletRatio,
         snap.socialScore,
+        snap.syntheticFlowCount,
+        snap.solPerMinute1mMixed,
+        snap.solPerMinute5mMixed,
+        snap.avgTradeSizeSOLMixed,
         snap.predictionMs, snap.createdAt,
       );
     } catch (err) {
@@ -692,6 +741,10 @@ export class FeatureStore {
         marketCapSOL: r.market_cap_sol as number,
         tier: r.tier as CurveSnapshotRecord['tier'],
         tradeCount: r.trade_count as number,
+        syntheticFlowCount: (r.synthetic_flow_count as number | undefined) ?? 0,
+        solPerMinute1mMixed: (r.sol_per_minute_1m_mixed as number | undefined) ?? 0,
+        solPerMinute5mMixed: (r.sol_per_minute_5m_mixed as number | undefined) ?? 0,
+        avgTradeSizeSOLMixed: (r.avg_trade_size_sol_mixed as number | undefined) ?? 0,
         pGrad: r.p_grad as number,
         confidence: r.confidence as number,
         breakeven: r.breakeven as number,
@@ -782,6 +835,8 @@ export class FeatureStore {
         SELECT
           s.id, s.mint, s.timestamp_ms, s.created_at,
           s.progress, s.real_sol_sol, s.price_sol, s.market_cap_sol, s.tier, s.trade_count,
+          s.synthetic_flow_count, s.sol_per_minute_1m_mixed, s.sol_per_minute_5m_mixed,
+          s.avg_trade_size_sol_mixed,
           s.p_grad, s.confidence, s.breakeven, s.action, s.veto_reason,
           s.sol_per_minute_1m, s.sol_per_minute_5m,
           s.avg_trade_size_sol, s.velocity_ratio,

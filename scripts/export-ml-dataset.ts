@@ -2,8 +2,9 @@
 /**
  * Export curve_snapshots / curve_outcomes / paper trades to CSV for Excel or training pipelines.
  * - curve_training_labeled.csv : snapshots HOT (features) JOIN outcomes (labels) — dataset supervisé principal
- * Usage: bun scripts/export-ml-dataset.ts [path/to/apex.db] [--last-snapshot-per-mint]
+ * Usage: bun scripts/export-ml-dataset.ts [path/to/apex.db] [--last-snapshot-per-mint] [--snapshots-without-outcome]
  * Env: EXPORT_ML_LAST_SNAPSHOT_ONLY=1 — même effet que le flag (dataset supervisé : 1 ligne / mint).
+ * Env: EXPORT_ML_UNLABELED_SNAPSHOTS=1 — exporte curve_snapshots_unlabeled.csv (mints sans outcome).
  */
 
 import { Database } from 'bun:sqlite';
@@ -14,6 +15,9 @@ const argv = process.argv.slice(2);
 const lastSnapshotPerMint =
   argv.includes('--last-snapshot-per-mint') ||
   (process.env.EXPORT_ML_LAST_SNAPSHOT_ONLY ?? '').trim() === '1';
+const exportUnlabeledSnapshots =
+  argv.includes('--snapshots-without-outcome') ||
+  (process.env.EXPORT_ML_UNLABELED_SNAPSHOTS ?? '').trim() === '1';
 const dbPath = argv.find((a) => !a.startsWith('-')) ?? 'data/apex.db';
 
 function csvCell(v: unknown): string {
@@ -117,6 +121,52 @@ try {
     console.log('⚠️ Labeled export skipped:', (e as Error).message);
   }
 
+  if (exportUnlabeledSnapshots) {
+    try {
+      const unlabeled = db
+        .query(
+          `
+        SELECT s.*
+        FROM curve_snapshots s
+        LEFT JOIN curve_outcomes o ON s.mint = o.mint
+        WHERE o.mint IS NULL
+        ORDER BY s.timestamp_ms DESC
+        LIMIT 100000
+      `,
+        )
+        .all() as Record<string, unknown>[];
+      if (unlabeled.length > 0) {
+        const out = 'data/curve_snapshots_unlabeled.csv';
+        await mkdir(dirname(out), { recursive: true });
+        await Bun.write(out, rowsToCsv(unlabeled));
+        console.log(
+          `✅ Exported ${unlabeled.length} unlabeled snapshots (no curve_outcomes row) → ${out}`,
+        );
+      } else {
+        console.log('⚠️ No unlabeled snapshots (all mints have outcomes or no snapshots)');
+      }
+    } catch (e) {
+      console.log('⚠️ Unlabeled snapshots export skipped:', (e as Error).message);
+    }
+  }
+
+  try {
+    const reasonRows = db
+      .query(
+        `SELECT COALESCE(eviction_reason, '(null)') AS eviction_reason, COUNT(*) AS count
+         FROM curve_outcomes GROUP BY eviction_reason ORDER BY count DESC`,
+      )
+      .all() as Record<string, unknown>[];
+    if (reasonRows.length > 0) {
+      const out = 'data/curve_outcomes_eviction_summary.csv';
+      await mkdir(dirname(out), { recursive: true });
+      await Bun.write(out, rowsToCsv(reasonRows));
+      console.log(`✅ Exported eviction_reason breakdown → ${out}`);
+    }
+  } catch {
+    /* optional */
+  }
+
   let openCount = 0;
   try {
     const openRows = db.query('SELECT * FROM open_curve_positions').all() as Record<string, unknown>[];
@@ -162,7 +212,11 @@ try {
       console.log(`✅ Exported ${lines.length} paper trades → ${out}`);
     }
   } catch {
-    console.log('⚠️ No paper_trades.jsonl or parse error');
+    if ((process.env.PAPER_TRADE_LOG ?? '').trim() === '0') {
+      console.log('⚠️ paper_trades.jsonl absent : PAPER_TRADE_LOG=0 (logging paper désactivé)');
+    } else {
+      console.log('⚠️ No paper_trades.jsonl or parse error');
+    }
   }
 
   console.log('\n📊 RÉSUMÉ BASE DE DONNÉES :');

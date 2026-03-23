@@ -3,16 +3,19 @@
  * Utilisé pour NarrativeRadar + métadonnées courbe Pump.fun (remplace le placeholder PUMP/Pump Token).
  */
 
+import { defaultDexScreenerTimeoutMs, fetchWithTimeout } from '../infra/fetchWithTimeout.js';
+
 const DEX_TOKEN_URL = 'https://api.dexscreener.com/latest/dex/tokens';
-const TIMEOUT_MS = 2_500;
 
 export async function fetchDexSolanaTokenMeta(
   mint: string,
 ): Promise<{ name: string; symbol: string } | null> {
   try {
-    const resp = await fetch(`${DEX_TOKEN_URL}/${mint}`, {
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
+    const resp = await fetchWithTimeout(
+      `${DEX_TOKEN_URL}/${mint}`,
+      {},
+      defaultDexScreenerTimeoutMs(),
+    );
     if (!resp.ok) return null;
     const data = (await resp.json()) as {
       pairs?: Array<{ chainId?: string; baseToken?: { name?: string; symbol?: string } }>;

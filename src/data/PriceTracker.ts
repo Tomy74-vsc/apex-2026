@@ -10,12 +10,12 @@
 
 import { getFeatureStore } from './FeatureStore.js';
 import type { TokenLabelRecord } from '../types/index.js';
+import { defaultDexScreenerTimeoutMs, fetchWithTimeout } from '../infra/fetchWithTimeout.js';
 
 const HORIZONS_MS = [5_000, 30_000, 120_000, 600_000] as const;
 type HorizonMs = (typeof HORIZONS_MS)[number];
 
 const DEXSCREENER_URL = 'https://api.dexscreener.com/latest/dex/tokens';
-const FETCH_TIMEOUT_MS = 3_000;
 const MAX_TRACKED = 500;
 const DEXSCREENER_RATE_LIMIT_MS = 300;
 
@@ -173,12 +173,15 @@ export class PriceTracker {
 
   private async fetchPrice(mint: string): Promise<number | null> {
     try {
-      const resp = await fetch(`${DEXSCREENER_URL}/${mint}`, {
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-        headers: {
-          'User-Agent': 'Mozilla/5.0 APEX-2026-HFT',
+      const resp = await fetchWithTimeout(
+        `${DEXSCREENER_URL}/${mint}`,
+        {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 APEX-2026-HFT',
+          },
         },
-      });
+        defaultDexScreenerTimeoutMs(),
+      );
 
       if (!resp.ok) return null;
 

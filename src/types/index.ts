@@ -212,7 +212,12 @@ export interface CurveSnapshotRecord {
   priceSOL: number;
   marketCapSOL: number;
   tier: 'cold' | 'warm' | 'hot';
+  /** Achats wallet (non-synthétiques) — aligné TrackedCurve.tradeCount. */
   tradeCount: number;
+  syntheticFlowCount: number;
+  solPerMinute1mMixed: number;
+  solPerMinute5mMixed: number;
+  avgTradeSizeSOLMixed: number;
 
   // Prediction result
   pGrad: number;

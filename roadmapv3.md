@@ -629,7 +629,7 @@ CLASSE WhaleWalletDB :
     → getGraduationPredictor().setSmartMoneyList(whales.map(w => w.address))
     → Logger "🐋 [WhaleDB] Loaded {N} whales into SmartMoneyTracker"
 
-SCRIPT scripts/discover-whales.ts :
+SCRIPT scripts/discover-whales.ts (équivalent `scripts/seed-whales.ts`, `bun run discover:whales`) :
 
   Algorithme de découverte rétroactive :
   1. Récupérer les tokens gradués depuis curve_outcomes WHERE graduated = 1

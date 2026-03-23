@@ -97,9 +97,10 @@ export class GraduationPredictor {
     const walletScore = this.walletScorer.analyze(trades, curve.state.creator.toBase58());
 
     const realSolLamports = BigInt(Math.round(curve.realSolSOL * LAMPORTS_PER_SOL));
-    const buyCount = trades.filter((t) => t.isBuy).length;
+    /** Achats wallet réels (hors flux réserve synthétique) — gates MIN_TRADE / confiance. */
+    const buyCountWallet = trades.filter((t) => t.isBuy && !t.synthetic).length;
 
-    if (buyCount === 0) {
+    if (buyCountWallet === 0) {
       return this.predictFromCurveState(
         curve,
         realSolLamports,
@@ -111,8 +112,8 @@ export class GraduationPredictor {
       );
     }
 
-    /** APEX §6 — confiance scoring pondéré bornée [0.3, 0.8] (données trades). */
-    const confidenceWeighted = Math.min(0.8, 0.3 + 0.7 * Math.min(1, buyCount / 30));
+    /** APEX §6 — confiance scoring pondéré bornée [0.3, 0.8] (données trades wallet). */
+    const confidenceWeighted = Math.min(0.8, 0.3 + 0.7 * Math.min(1, buyCountWallet / 30));
 
     // ─── APEX §5 V1–V5 (ordre strict) puis gates roadmapv3 ─────────────
     let vetoReason: string | null = null;
@@ -141,8 +142,8 @@ export class GraduationPredictor {
       }
     }
 
-    if (!vetoReason && buyCount < MIN_TRADE_COUNT()) {
-      vetoReason = `insufficient_trades: ${buyCount} < ${MIN_TRADE_COUNT()}`;
+    if (!vetoReason && buyCountWallet < MIN_TRADE_COUNT()) {
+      vetoReason = `insufficient_trades: ${buyCountWallet} < ${MIN_TRADE_COUNT()}`;
       vetoBucket = 'min_trades';
     }
 

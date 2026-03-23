@@ -12,6 +12,8 @@
  * Returns: sentiment (-1 to 1), confidence (0 to 1), and classification.
  */
 
+import { envHttpTimeoutMs, fetchWithTimeout } from '../infra/fetchWithTimeout.js';
+
 export interface Stage1Result {
   sentiment: number;     // -1 (bearish) to 1 (bullish)
   confidence: number;    // 0 to 1
@@ -103,23 +105,26 @@ export class Stage1Groq {
       this.recordRequest();
       this.stats.requests++;
 
-      const resp = await fetch(GROQ_API_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.apiKey}`,
+      const resp = await fetchWithTimeout(
+        GROQ_API_URL,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${this.apiKey}`,
+          },
+          body: JSON.stringify({
+            model: GROQ_MODEL,
+            messages: [
+              { role: 'system', content: SYSTEM_PROMPT },
+              { role: 'user', content: text.slice(0, 500) },
+            ],
+            max_tokens: 100,
+            temperature: 0.1,
+          }),
         },
-        body: JSON.stringify({
-          model: GROQ_MODEL,
-          messages: [
-            { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: text.slice(0, 500) },
-          ],
-          max_tokens: 100,
-          temperature: 0.1,
-        }),
-        signal: AbortSignal.timeout(GROQ_TIMEOUT_MS),
-      });
+        envHttpTimeoutMs('HTTP_GROQ_TIMEOUT_MS', GROQ_TIMEOUT_MS),
+      );
 
       if (!resp.ok) {
         if (resp.status === 429) {

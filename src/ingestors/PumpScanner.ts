@@ -1,14 +1,11 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import { EventEmitter } from 'events';
 import { getMint } from '@solana/spl-token';
-import WS from 'ws';
-
-/** Payload `ws` `message` (aligné sur @types/ws sans dépendre de RawData exporté). */
-type WsMessagePayload = string | Buffer | ArrayBuffer | Buffer[];
 import type { MarketEvent, TokenMetadata } from '../types/index.js';
 import { getCurveTracker } from '../modules/curve-tracker/CurveTracker.js';
 import { fetchDexSolanaTokenMeta } from './dexPumpMeta.js';
 import { getNarrativeRadar, type NarrativeSignal } from '../social/NarrativeRadar.js';
+import { parseSolanaWsUrlsFromEnv, WebSocketPool } from '../infra/WebSocketPool.js';
 import { KOTH_SOL_THRESHOLD } from '../constants/pumpfun.js';
 import { deriveBondingCurvePDA, decodeBondingCurve, type BondingCurveState } from '../types/bonding-curve.js';
 import { calcProgress } from '../math/curve-math.js';
@@ -49,7 +46,7 @@ export interface PumpScannerOptions {
 
 export class PumpScanner extends EventEmitter {
   private connection: Connection;
-  private ws: WS | null = null;
+  private wsPool: WebSocketPool | null = null;
   private wsSubId: number | null = null;
   private processedSignatures: Set<string> = new Set();
   private isRunning: boolean = false;
@@ -65,9 +62,6 @@ export class PumpScanner extends EventEmitter {
 
   private readonly rpcUrl: string;
   private readonly wsEndpoints: string[];
-  private activeWsIndex = 0;
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private readonly RECONNECT_DELAY_MS = 5_000;
   private readonly HEALTH_CHECK_INTERVAL_MS = 15_000;
   private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
   private lastEventTs = 0;
@@ -94,7 +88,9 @@ export class PumpScanner extends EventEmitter {
     const heliusWs = options.wsUrl || process.env.HELIUS_WS_URL || this.rpcUrl.replace('https://', 'wss://');
     const publicWs = 'wss://api.mainnet-beta.solana.com';
 
-    this.wsEndpoints = [publicWs, heliusWs].filter(Boolean);
+    const fromEnv = parseSolanaWsUrlsFromEnv();
+    this.wsEndpoints =
+      fromEnv.length > 0 ? fromEnv : [publicWs, heliusWs].filter(Boolean);
 
     if (!this.rpcUrl) {
       throw new Error('RPC URL must be provided via options or HELIUS_RPC_URL env var');
@@ -128,52 +124,58 @@ export class PumpScanner extends EventEmitter {
 
     this.isRunning = true;
     this.lastEventTs = Date.now();
-    this.connectWs();
+    this.attachWebSocketPool();
 
     this.healthCheckTimer = setInterval(() => this.checkHealth(), this.HEALTH_CHECK_INTERVAL_MS);
   }
 
-  private connectWs(): void {
-    const wsUrl = this.wsEndpoints[this.activeWsIndex] ?? this.wsEndpoints[0]!;
+  private attachWebSocketPool(): void {
+    if (this.wsPool) {
+      this.wsPool.removeAllListeners();
+      this.wsPool.stop();
+      this.wsPool = null;
+    }
 
     try {
-      if (this.ws) {
-        try { this.ws.terminate(); } catch {}
-        this.ws = null;
-      }
+      this.wsPool = new WebSocketPool({
+        urls: this.wsEndpoints,
+        handshakeTimeoutMs: 10_000,
+        reconnectDelayMs: 5_000,
+      });
 
-      this.ws = new WS(wsUrl, { perMessageDeflate: false, handshakeTimeout: 10_000 });
-
-      this.ws.on('open', () => {
+      this.wsPool.on('open', (wsUrl: string) => {
         console.log(`[PumpScanner] ✅ WS connected: ${wsUrl.slice(0, 50)}`);
         const commitment = this.isCurveMode ? 'confirmed' : 'processed';
         const subId = this.rpcIdCounter++;
-        this.ws!.send(JSON.stringify({
-          jsonrpc: '2.0',
-          id: subId,
-          method: 'logsSubscribe',
-          params: [
-            { mentions: [PUMP_PROGRAM_ID.toBase58()] },
-            { commitment },
-          ],
-        }));
+        this.wsPool?.send(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: subId,
+            method: 'logsSubscribe',
+            params: [
+              { mentions: [PUMP_PROGRAM_ID.toBase58()] },
+              { commitment },
+            ],
+          }),
+        );
         this.lastEventTs = Date.now();
         this.emit('connected');
       });
 
-      this.ws.on('message', (raw: WsMessagePayload) => {
+      this.wsPool.on('jsonrpc', (msg: { result?: unknown; method?: string; params?: { result?: { value?: unknown; context?: { slot?: number } } } }) => {
         try {
           this.lastEventTs = Date.now();
-          const msg = JSON.parse(raw.toString());
 
           if (msg.result !== undefined && !msg.method) {
-            this.wsSubId = msg.result;
+            this.wsSubId = msg.result as number;
             return;
           }
 
           if (msg.method === 'logsNotification') {
             const result = msg.params?.result;
-            const value = result?.value;
+            const value = result?.value as
+              | { signature?: string; err?: unknown; logs?: string[] }
+              | undefined;
             if (!value) return;
             const logs = {
               signature: value.signature as string,
@@ -183,20 +185,29 @@ export class PumpScanner extends EventEmitter {
             const context = { slot: result?.context?.slot ?? 0 };
             this.handleLogs(logs, context).catch(() => {});
           }
-        } catch {}
+        } catch {
+          /* cold path */
+        }
       });
 
-      this.ws.on('close', () => {
-        console.warn(`⚠️  [PumpScanner] WS closed — scheduling reconnect`);
-        this.scheduleReconnect();
+      this.wsPool.on('close', () => {
+        console.warn(`⚠️  [PumpScanner] WS closed — pool failover / reconnect`);
       });
 
-      this.ws.on('error', (err: Error) => {
+      this.wsPool.on('failover', (idx: number, nextUrl: string) => {
+        this.statsInternal.wsReconnects++;
+        console.log(
+          `🔄 [PumpScanner] WS failover #${idx} → ${nextUrl.slice(0, 40)}…`,
+        );
+      });
+
+      this.wsPool.on('socketError', (err: Error) => {
         console.warn(`⚠️  [PumpScanner] WS error: ${err.message?.slice(0, 80)}`);
       });
+
+      this.wsPool.start();
     } catch (err) {
-      console.error(`❌ [PumpScanner] WS connect failed:`, err);
-      this.scheduleReconnect();
+      console.error(`❌ [PumpScanner] WS pool failed:`, err);
     }
   }
 
@@ -204,22 +215,10 @@ export class PumpScanner extends EventEmitter {
     if (!this.isRunning) return;
     const silenceSec = (Date.now() - this.lastEventTs) / 1_000;
     if (silenceSec > 60) {
-      console.warn(`⚠️  [PumpScanner] No WS events for ${silenceSec.toFixed(0)}s — reconnecting...`);
-      this.scheduleReconnect();
-    }
-  }
-
-  private scheduleReconnect(): void {
-    if (this.reconnectTimer || !this.isRunning) return;
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      if (!this.isRunning) return;
-
-      this.activeWsIndex = (this.activeWsIndex + 1) % this.wsEndpoints.length;
+      console.warn(`⚠️  [PumpScanner] No WS events for ${silenceSec.toFixed(0)}s — rotating endpoint...`);
       this.statsInternal.wsReconnects++;
-      console.log(`🔄 [PumpScanner] Reconnecting to WS #${this.activeWsIndex} (${this.wsEndpoints[this.activeWsIndex]?.slice(0, 40)}...)`);
-      this.connectWs();
-    }, this.RECONNECT_DELAY_MS);
+      this.wsPool?.forceRotateReconnect();
+    }
   }
 
   async stop(): Promise<void> {
@@ -231,24 +230,23 @@ export class PumpScanner extends EventEmitter {
     this.isRunning = false;
 
     if (this.healthCheckTimer) { clearInterval(this.healthCheckTimer); this.healthCheckTimer = null; }
-    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
 
-    if (this.ws) {
-      if (this.wsSubId !== null) {
-        try {
-          this.ws.send(JSON.stringify({
-            jsonrpc: '2.0',
-            id: this.rpcIdCounter++,
-            method: 'logsUnsubscribe',
-            params: [this.wsSubId],
-          }));
-        } catch {}
-      }
-      try { this.ws.terminate(); } catch {}
-      this.ws = null;
+    const unsub: string[] = [];
+    if (this.wsSubId !== null) {
+      unsub.push(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: this.rpcIdCounter++,
+          method: 'logsUnsubscribe',
+          params: [this.wsSubId],
+        }),
+      );
     }
-
-    this.isRunning = false;
+    if (this.wsPool) {
+      this.wsPool.removeAllListeners();
+      this.wsPool.stopAfterSends(unsub);
+      this.wsPool = null;
+    }
     this.emit('disconnected');
     console.log('[PumpScanner] ✅ Arrêté');
   }
@@ -663,7 +661,7 @@ export class PumpScanner extends EventEmitter {
       ...this.statsInternal,
       mode: this.isCurveMode ? 'curve-prediction' : 'legacy',
       minRegistrationSOL: this.minRegistrationSOL,
-      activeWsEndpoint: this.wsEndpoints[this.activeWsIndex]?.slice(0, 40) ?? 'none',
+      activeWsEndpoint: this.wsPool?.activeUrl.slice(0, 40) ?? this.wsEndpoints[0]?.slice(0, 40) ?? 'none',
     };
   }
 }

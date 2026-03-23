@@ -47,7 +47,7 @@ export function evaluateEntryGates(
     }
   }
 
-  const buys = trades.filter((t) => t.isBuy);
+  const buys = trades.filter((t) => t.isBuy && !t.synthetic);
   const trivialLamport = envFloat('TRIVIAL_TX_SOL', 0.001);
   const maxTrivial = envFloat('MAX_TRIVIAL_TX_RATIO', 0.6);
   const minBuysForTrivial = envFloat('ENTRY_FILTER_MIN_BUYS_TRIVIAL', 5);

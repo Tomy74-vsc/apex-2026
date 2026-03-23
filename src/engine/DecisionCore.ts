@@ -188,6 +188,10 @@ export class DecisionCore extends EventEmitter {
         marketCapSOL: curve.marketCapSOL,
         tier: curve.tier,
         tradeCount: curve.tradeCount,
+        syntheticFlowCount: curve.syntheticFlowEventCount ?? 0,
+        solPerMinute1mMixed: prediction.velocity.solPerMinute1mMixed,
+        solPerMinute5mMixed: prediction.velocity.solPerMinute5mMixed,
+        avgTradeSizeSOLMixed: prediction.velocity.avgTradeSizeSOLMixed,
         pGrad: prediction.pGrad,
         confidence: prediction.confidence,
         breakeven: prediction.breakeven,
@@ -213,7 +217,7 @@ export class DecisionCore extends EventEmitter {
 
   /**
    * Process a curve that entered the HOT zone.
-   * Pipeline: Guard.validateCurve() → AIBrain.decideCurve() → emit readyCurveBuy / log
+   * Pipeline: Guard.validateCurveForExecution() → AIBrain.decideCurve() → emit readyCurveBuy / log
    */
   async processCurveEvent(
     curve: TrackedCurve,
@@ -233,7 +237,7 @@ export class DecisionCore extends EventEmitter {
     const t0 = performance.now();
 
     try {
-      const guardResult = this.guard.validateCurve(curve, this.activeCurvePositions);
+      const guardResult = await this.guard.validateCurveForExecution(curve, this.activeCurvePositions);
       if (!guardResult.allowed) {
         if (!this.curveLoggedEnter.has(curve.mint)) {
           console.log(

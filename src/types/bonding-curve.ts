@@ -41,7 +41,10 @@ export interface TrackedCurve {
   createdAt: number;              // Unix ms
   lastUpdated: number;            // Unix ms
   tier: 'cold' | 'warm' | 'hot';
+  /** Achats wallet non-synthétiques (tx parsées) — aligné MIN_TRADE / vélocité wallet. */
   tradeCount: number;
+  /** Événements Δ réserves (poll) — exclus des heuristiques bot/wallet. */
+  syntheticFlowEventCount: number;
   metadata: { name?: string; symbol?: string; uri?: string };
 
   /** Phase B: set when promoted to HOT (predictor min time-in-HOT gate). */

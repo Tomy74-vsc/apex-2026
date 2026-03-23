@@ -4,6 +4,7 @@
  */
 
 import { EventEmitter } from 'events';
+import { defaultDexScreenerTimeoutMs, fetchWithTimeout } from '../infra/fetchWithTimeout.js';
 
 const DEX_BOOST_URL = 'https://api.dexscreener.com/token-boosts/latest/v1';
 
@@ -49,9 +50,7 @@ export class SocialTrendScanner extends EventEmitter {
   private async pollBoosts(): Promise<void> {
     const t0 = performance.now();
     try {
-      const resp = await fetch(DEX_BOOST_URL, {
-        signal: AbortSignal.timeout(5_000),
-      });
+      const resp = await fetchWithTimeout(DEX_BOOST_URL, {}, defaultDexScreenerTimeoutMs());
       if (!resp.ok) return;
 
       const data = (await resp.json()) as unknown;

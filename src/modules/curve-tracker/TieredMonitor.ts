@@ -104,6 +104,7 @@ export class TieredMonitor extends EventEmitter {
       lastUpdated: now,
       tier: 'cold',
       tradeCount: 0,
+      syntheticFlowEventCount: 0,
       metadata: metadata ?? {},
       lastProgressChangeAt: now,
     };
@@ -156,6 +157,7 @@ export class TieredMonitor extends EventEmitter {
       lastUpdated: now,
       tier: 'warm',
       tradeCount: 0,
+      syntheticFlowEventCount: 0,
       metadata: metadata ?? {},
       lastProgressChangeAt: now,
       narrativeMatch: narrativeMatch ? true : undefined,

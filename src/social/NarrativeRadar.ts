@@ -8,6 +8,7 @@
 import { EventEmitter } from 'events';
 import { XAI_RESPONSES_WEB_TOOLS } from './xai-live-search.js';
 import { getCurveTracker } from '../modules/curve-tracker/CurveTracker.js';
+import { fetchWithTimeout } from '../infra/fetchWithTimeout.js';
 import type { TrackedCurve } from '../types/bonding-curve.js';
 
 function narrativeResponsesTimeoutMs(): number {
@@ -249,40 +250,43 @@ export class NarrativeRadar extends EventEmitter {
     try {
       this.pruneNarrativeWatchlist(Date.now());
 
-      const response = await fetch(`${this.baseUrl}/responses`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json',
+      const response = await fetchWithTimeout(
+        `${this.baseUrl}/responses`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: this.model,
+            tools: XAI_RESPONSES_WEB_TOOLS,
+            input: [
+              {
+                role: 'system',
+                content:
+                  'You scan live social data (X first; note Reddit crypto subs or Telegram crypto channels only if your search surfaces them). ' +
+                  'Classify sentiment and flag narrative inflections (FOMO spike, panic, skeptical rotation) BEFORE they fully show in price charts. ' +
+                  'Detect: (1) burst of repeated ticker/meme mentions; (2) coordinated-looking pushes from verified or large accounts; ' +
+                  '(3) emotional tone shifts. Use ONLY evidence from the LAST ~30 MINUTES. Return ONLY a JSON array, no markdown.',
+              },
+              {
+                role: 'user',
+                content:
+                  'Quels memes, narratifs ou tickers crypto émergent sur X dans les ~30 dernières minutes ? ' +
+                  'Focus : Solana, Pump.fun, memecoins. Si pertinent, indique si le même thème apparaît sur Reddit ou Telegram. ' +
+                  'Pour chaque tendance, UN objet JSON : theme (label court), velocity 1-10 (vélocité des mentions), ' +
+                  'mentionSpike 1-10 (répétitions / pic soudain), toneShift (ex. rising_fomo, euphoric, neutral, panic, skeptical), ' +
+                  'verifiedSignals 0-50 (estimation comptes vérifiés / KOL notables), keywords minuscules, tickers style $PEPE, ' +
+                  'contractAddresses (mints Solana si connus), confidence 0-1. ' +
+                  'Exemple : [{"theme":"...","velocity":7,"mentionSpike":8,"toneShift":"rising_fomo","verifiedSignals":4,"keywords":["pepe"],"tickers":["$PEPE"],"contractAddresses":[],"confidence":0.7}]',
+              },
+            ],
+            max_output_tokens: 2048,
+          }),
         },
-        body: JSON.stringify({
-          model: this.model,
-          tools: XAI_RESPONSES_WEB_TOOLS,
-          input: [
-            {
-              role: 'system',
-              content:
-                'You scan live social data (X first; note Reddit crypto subs or Telegram crypto channels only if your search surfaces them). ' +
-                'Classify sentiment and flag narrative inflections (FOMO spike, panic, skeptical rotation) BEFORE they fully show in price charts. ' +
-                'Detect: (1) burst of repeated ticker/meme mentions; (2) coordinated-looking pushes from verified or large accounts; ' +
-                '(3) emotional tone shifts. Use ONLY evidence from the LAST ~30 MINUTES. Return ONLY a JSON array, no markdown.',
-            },
-            {
-              role: 'user',
-              content:
-                'Quels memes, narratifs ou tickers crypto émergent sur X dans les ~30 dernières minutes ? ' +
-                'Focus : Solana, Pump.fun, memecoins. Si pertinent, indique si le même thème apparaît sur Reddit ou Telegram. ' +
-                'Pour chaque tendance, UN objet JSON : theme (label court), velocity 1-10 (vélocité des mentions), ' +
-                'mentionSpike 1-10 (répétitions / pic soudain), toneShift (ex. rising_fomo, euphoric, neutral, panic, skeptical), ' +
-                'verifiedSignals 0-50 (estimation comptes vérifiés / KOL notables), keywords minuscules, tickers style $PEPE, ' +
-                'contractAddresses (mints Solana si connus), confidence 0-1. ' +
-                'Exemple : [{"theme":"...","velocity":7,"mentionSpike":8,"toneShift":"rising_fomo","verifiedSignals":4,"keywords":["pepe"],"tickers":["$PEPE"],"contractAddresses":[],"confidence":0.7}]',
-            },
-          ],
-          max_output_tokens: 2048,
-        }),
-        signal: AbortSignal.timeout(narrativeResponsesTimeoutMs()),
-      });
+        narrativeResponsesTimeoutMs(),
+      );
 
       const rawBody = await response.text();
       if (!response.ok) {

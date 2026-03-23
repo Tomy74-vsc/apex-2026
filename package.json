@@ -15,7 +15,8 @@
     "verify": "bun --version && bun run typecheck",
     "verify:xai": "bun scripts/verify-xai.ts",
     "export:ml": "bun scripts/export-ml-dataset.ts",
-    "seed:whales": "bun scripts/seed-whales.ts"
+    "seed:whales": "bun scripts/seed-whales.ts",
+    "discover:whales": "bun scripts/discover-whales.ts"
   },
   "devDependencies": {
     "@types/bun": "1.3.11",

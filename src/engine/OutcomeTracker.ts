@@ -12,9 +12,9 @@
 
 import { getFeatureStore } from '../data/FeatureStore.js';
 import type { TokenOutcomeRecord } from '../types/index.js';
+import { defaultDexScreenerTimeoutMs, fetchWithTimeout } from '../infra/fetchWithTimeout.js';
 
 const DEXSCREENER_URL = 'https://api.dexscreener.com/latest/dex/tokens';
-const FETCH_TIMEOUT_MS = 3_000;
 const RATE_LIMIT_MS = 300;
 
 const HORIZON_5M_MS = 5 * 60_000;
@@ -170,10 +170,13 @@ export class OutcomeTracker {
 
   private async fetchPrice(mint: string): Promise<number | null> {
     try {
-      const resp = await fetch(`${DEXSCREENER_URL}/${mint}`, {
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-        headers: { 'User-Agent': 'Mozilla/5.0 APEX-2026-HFT' },
-      });
+      const resp = await fetchWithTimeout(
+        `${DEXSCREENER_URL}/${mint}`,
+        {
+          headers: { 'User-Agent': 'Mozilla/5.0 APEX-2026-HFT' },
+        },
+        defaultDexScreenerTimeoutMs(),
+      );
 
       if (!resp.ok) return null;
 

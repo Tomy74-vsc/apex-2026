@@ -19,6 +19,7 @@ import type {
 import type { TrackedCurve, CurveTradeEvent } from '../types/bonding-curve.js';
 import { evaluateEntryGates } from '../modules/entry/EntryFilter.js';
 import { getCurveVelocityAnalyzer } from '../modules/position/curveVelocitySingleton.js';
+import { getSentimentAggregator } from '../social/SentimentAggregator.js';
 
 /**
  * Événements émis par le DecisionCore
@@ -162,12 +163,62 @@ export class DecisionCore extends EventEmitter {
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
+   * Append one ML snapshot for every HOT poll (predictor-only, no Guard/EntryFilter/cooldown).
+   */
+  appendHotObservationSnapshot(
+    curve: TrackedCurve,
+    trades: CurveTradeEvent[],
+    socialScore = 0,
+    grokEnriched = false,
+  ): void {
+    const t0 = performance.now();
+    try {
+      const prediction = getAIBrain().predictCurveOnly(curve, trades, socialScore, grokEnriched);
+      const now = Date.now();
+      const aggSocial = getSentimentAggregator().getScore(curve.mint);
+      const socialForMl = Math.max(0, Math.min(1, Math.max(aggSocial, socialScore)));
+      const snap: CurveSnapshotRecord = {
+        id: crypto.randomUUID(),
+        mint: curve.mint,
+        timestampMs: now,
+        progress: curve.progress,
+        realSolSOL: curve.realSolSOL,
+        priceSOL: curve.priceSOL,
+        marketCapSOL: curve.marketCapSOL,
+        tier: curve.tier,
+        tradeCount: curve.tradeCount,
+        pGrad: prediction.pGrad,
+        confidence: prediction.confidence,
+        breakeven: prediction.breakeven,
+        action: prediction.action,
+        vetoReason: prediction.vetoReason,
+        solPerMinute1m: prediction.velocity.solPerMinute_1m,
+        solPerMinute5m: prediction.velocity.solPerMinute_5m,
+        avgTradeSizeSOL: prediction.velocity.avgTradeSize_SOL,
+        velocityRatio: prediction.velocity.velocityRatio,
+        botTransactionRatio: prediction.botSignal.botTransactionRatio,
+        smartMoneyBuyerCount: prediction.walletScore.smartMoneyBuyerCount,
+        creatorIsSelling: prediction.walletScore.creatorIsSelling ? 1 : 0,
+        freshWalletRatio: prediction.walletScore.freshWalletRatio,
+        socialScore: socialForMl,
+        predictionMs: performance.now() - t0,
+        createdAt: now,
+      };
+      getFeatureStore().appendCurveSnapshot(snap);
+    } catch {
+      /* cold path */
+    }
+  }
+
+  /**
    * Process a curve that entered the HOT zone.
    * Pipeline: Guard.validateCurve() → AIBrain.decideCurve() → emit readyCurveBuy / log
    */
   async processCurveEvent(
     curve: TrackedCurve,
     trades: CurveTradeEvent[],
+    socialScore = 0,
+    grokEnriched = false,
   ): Promise<CurveDecision | null> {
     const now = Date.now();
     const lastEval = this.curveCooldowns.get(curve.mint);
@@ -202,39 +253,7 @@ export class DecisionCore extends EventEmitter {
       }
 
       const brain = getAIBrain();
-      const decision = brain.decideCurve(curve, trades);
-
-      try {
-        const snap: CurveSnapshotRecord = {
-          id: crypto.randomUUID(),
-          mint: curve.mint,
-          timestampMs: now,
-          progress: curve.progress,
-          realSolSOL: curve.realSolSOL,
-          priceSOL: curve.priceSOL,
-          marketCapSOL: curve.marketCapSOL,
-          tier: curve.tier,
-          tradeCount: curve.tradeCount,
-          pGrad: decision.pGrad,
-          confidence: decision.confidence,
-          breakeven: decision.breakeven,
-          action: decision.action,
-          vetoReason: decision.prediction.vetoReason,
-          solPerMinute1m: decision.prediction.velocity.solPerMinute_1m,
-          solPerMinute5m: decision.prediction.velocity.solPerMinute_5m,
-          avgTradeSizeSOL: decision.prediction.velocity.avgTradeSize_SOL,
-          velocityRatio: decision.prediction.velocity.velocityRatio,
-          botTransactionRatio: decision.prediction.botSignal.botTransactionRatio,
-          smartMoneyBuyerCount: decision.prediction.walletScore.smartMoneyBuyerCount,
-          creatorIsSelling: decision.prediction.walletScore.creatorIsSelling ? 1 : 0,
-          freshWalletRatio: decision.prediction.walletScore.freshWalletRatio,
-          predictionMs: decision.latencyMs,
-          createdAt: now,
-        };
-        getFeatureStore().appendCurveSnapshot(snap);
-      } catch {
-        // cold path silencieux
-      }
+      const decision = brain.decideCurve(curve, trades, socialScore, grokEnriched);
 
       if (decision.action === 'ENTER_CURVE') {
         this.curvesEntered++;

@@ -176,6 +176,8 @@ CREATE TABLE IF NOT EXISTS curve_snapshots (
   creator_is_selling    INTEGER NOT NULL DEFAULT 0,
   fresh_wallet_ratio    REAL    NOT NULL DEFAULT 0,
 
+  social_score          REAL    NOT NULL DEFAULT 0,
+
   -- Latency
   prediction_ms         REAL    NOT NULL DEFAULT 0,
   created_at            INTEGER NOT NULL
@@ -210,6 +212,22 @@ CREATE TABLE IF NOT EXISTS open_curve_positions (
   payload_json  TEXT    NOT NULL,
   updated_at    INTEGER NOT NULL
 );
+
+-- Whale / smart-money registry (seed + outcome enrichment)
+CREATE TABLE IF NOT EXISTS whale_wallets (
+  address           TEXT    PRIMARY KEY,
+  label             TEXT    NOT NULL DEFAULT 'unknown',
+  trust_score       REAL    NOT NULL DEFAULT 0.5,
+  tokens_bought     INTEGER NOT NULL DEFAULT 0,
+  tokens_graduated  INTEGER NOT NULL DEFAULT 0,
+  win_rate          REAL    NOT NULL DEFAULT 0,
+  last_seen_ms      INTEGER NOT NULL DEFAULT 0,
+  discovered_via    TEXT    NOT NULL DEFAULT 'manual',
+  created_at        INTEGER NOT NULL,
+  updated_at        INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_whale_wallets_trust ON whale_wallets(trust_score);
 `;
 
 // ─── Classe principale ────────────────────────────────────────────────────────
@@ -240,12 +258,31 @@ export class FeatureStore {
     this.db.run('PRAGMA journal_mode = WAL');
     this.db.run('PRAGMA synchronous = NORMAL');
     this.db.run(SCHEMA);
+    this.migrateCurveSnapshotsSocialScore();
 
     this.flushTimer = setInterval(() => {
       this.flush().catch(() => {});
     }, FLUSH_INTERVAL_MS);
 
     console.log(`✅ [FeatureStore] Initialisé → ${dbPath}`);
+  }
+
+  /** Same bun:sqlite connection (WAL) — for WhaleWalletDB and extensions. */
+  getSqliteHandle(): Database {
+    return this.db;
+  }
+
+  /** DBs créés avant social_score : ALTER TABLE idempotent. */
+  private migrateCurveSnapshotsSocialScore(): void {
+    try {
+      const cols = this.db.prepare('PRAGMA table_info(curve_snapshots)').all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === 'social_score')) {
+        this.db.run('ALTER TABLE curve_snapshots ADD COLUMN social_score REAL NOT NULL DEFAULT 0');
+        console.log('✅ [FeatureStore] Migration curve_snapshots.social_score');
+      }
+    } catch {
+      /* cold path */
+    }
   }
 
   // ─── API publique ───────────────────────────────────────────────────────────
@@ -593,14 +630,16 @@ export class FeatureStore {
           p_grad, confidence, breakeven, action, veto_reason,
           sol_per_minute_1m, sol_per_minute_5m, avg_trade_size_sol, velocity_ratio,
           bot_transaction_ratio, smart_money_buyer_cnt, creator_is_selling, fresh_wallet_ratio,
+          social_score,
           prediction_ms, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         snap.id, snap.mint, snap.timestampMs,
         snap.progress, snap.realSolSOL, snap.priceSOL, snap.marketCapSOL, snap.tier, snap.tradeCount,
         snap.pGrad, snap.confidence, snap.breakeven, snap.action, snap.vetoReason,
         snap.solPerMinute1m, snap.solPerMinute5m, snap.avgTradeSizeSOL, snap.velocityRatio,
         snap.botTransactionRatio, snap.smartMoneyBuyerCount, snap.creatorIsSelling, snap.freshWalletRatio,
+        snap.socialScore,
         snap.predictionMs, snap.createdAt,
       );
     } catch (err) {
@@ -661,6 +700,7 @@ export class FeatureStore {
         smartMoneyBuyerCount: r.smart_money_buyer_cnt as number,
         creatorIsSelling: r.creator_is_selling as number,
         freshWalletRatio: r.fresh_wallet_ratio as number,
+        socialScore: (r.social_score as number | undefined) ?? 0,
         predictionMs: r.prediction_ms as number,
         createdAt: r.created_at as number,
       }));
@@ -742,6 +782,7 @@ export class FeatureStore {
           s.avg_trade_size_sol, s.velocity_ratio,
           s.bot_transaction_ratio, s.smart_money_buyer_cnt,
           s.creator_is_selling, s.fresh_wallet_ratio,
+          s.social_score,
           o.graduated, o.final_progress, o.final_sol, o.duration_s
         FROM curve_snapshots s
         INNER JOIN curve_outcomes o ON s.mint = o.mint

@@ -233,6 +233,9 @@ export interface CurveSnapshotRecord {
   creatorIsSelling: number; // 0 or 1 for SQLite
   freshWalletRatio: number;
 
+  /** SentimentAggregator composite [0,1] at snapshot time (ML feature). */
+  socialScore: number;
+
   // Latency
   predictionMs: number;
   createdAt: number;

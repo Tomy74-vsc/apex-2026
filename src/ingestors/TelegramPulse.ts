@@ -26,6 +26,8 @@ export interface TelegramPulseEvents {
     source: 'Telegram';
     score: number;
     timestamp: number;
+    /** Texte brut du message (pour NLPPipeline / ViralityScorer) */
+    rawText: string;
   }) => void;
   'connected': () => void;
   'disconnected': () => void;
@@ -199,7 +201,8 @@ export class TelegramPulse extends EventEmitter {
         return; // Pas de texte, ignore
       }
 
-      const text = message.text.toString().toLowerCase();
+      const rawText = message.text.toString();
+      const text = rawText.toLowerCase();
 
       // Filtre le bruit (dexscreener, birdeye)
       if (this.containsNoise(text)) {
@@ -226,6 +229,7 @@ export class TelegramPulse extends EventEmitter {
             source: 'Telegram',
             score: 85, // Score fixe selon spécifications
             timestamp: Date.now(),
+            rawText,
           });
         }
       }
@@ -330,5 +334,10 @@ export class TelegramPulse extends EventEmitter {
       isRunning: this.isRunning,
       hasSession: this.sessionString.length > 0,
     };
+  }
+
+  /** Client GramJS actif (pour TelegramTokenScanner). Null si non démarré. */
+  getClient(): TelegramClient | null {
+    return this.client;
   }
 }

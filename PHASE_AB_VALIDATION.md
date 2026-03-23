@@ -8,7 +8,7 @@ Référence : `APEX_QUANT_STRATEGY.md`, `roadmapv3.md` (M1–M4 + P2/P3), `AGENT
 - RPC : `HELIUS_RPC_URL` ou `RPC_URL` (idéalement + `QUICKNODE_RPC_URL` pour le race)
 - `bun run typecheck` → 0 erreur
 
-## Variables d’environnement alignées plan (défauts = APEX §12 + code)
+## Variables d’environnement alignées plan (défauts = **APEX §0 + §12** + code)
 
 | Domaine | Variables |
 |--------|-----------|
@@ -17,7 +17,7 @@ Référence : `APEX_QUANT_STRATEGY.md`, `roadmapv3.md` (M1–M4 + P2/P3), `AGENT
 | Breakeven | Marge dynamique `safety_margin(confidence)` dans `BreakevenCurve` (pas de `SAFETY_MARGIN` fixe seul) |
 | EntryFilter (v4 1C) | `MIN_VELOCITY_SOL_MIN`, `ENTRY_VELOCITY_WINDOW_SEC`, `MAX_TRIVIAL_TX_RATIO`, `TRIVIAL_TX_SOL`, `ENTRY_FILTER_MIN_BUYS_TRIVIAL` |
 | Kelly / taille | `KELLY_FRACTION`, `MAX_POSITION_PCT`, **`MAX_POSITION_SOL`**, `MIN_POSITION_SOL`, `MIN_KELLY_FRACTION`, `PAPER_BANKROLL_SOL` |
-| Sorties | `STOP_LOSS_PCT`, `TRAILING_STOP_PCT`, `TAKE_PROFIT_PCT`, `TIME_STOP_SECONDS` (600), `TIME_STOP_MIN_PGRAD`, `STALL_VELOCITY_THRESHOLD`, `STALL_SOL_FLOW_MIN`, `STALL_DURATION_SECONDS` (120), `LIVE_PGRAD_REFRESH_MS` |
+| Sorties | `STOP_LOSS_PCT`, `TRAILING_STOP_PCT`, `TAKE_PROFIT_PCT`, `TIME_STOP_SECONDS` (**300** profil Rotation), `HARD_MAX_HOLD_SECONDS` (**300**), `TIME_STOP_MIN_PGRAD`, `STALL_SOL_FLOW_MIN` (**0.05**), `STALL_DURATION_SECONDS` (**90**), `EXIT_EVAL_COOLDOWN_MS`, `STALL_VELOCITY_THRESHOLD` (réservé, non ExitEngine), `LIVE_PGRAD_REFRESH_MS` — détail **`APEX_QUANT_STRATEGY.md` §0 + §8** |
 | Graduation exit | `GRAD_T1_PCT`, `GRAD_T2_PCT`, `GRAD_T2_DELAY_MS` (60_000), `GRAD_T3_DELAY_MS` |
 | Persistance A | `CURVE_POSITION_PERSIST`, `PAPER_TRADE_LOG`, `PAPER_TRADE_LOG_PATH` |
 | TieredMonitor | `TIER_HOT_STALL_MIN`, `TIER_HOT_MAX_AGE_MIN`, `TIER_WARM_MAX_AGE_MIN`, `TIER_COLD_STALE_MIN`, `TIER_PROGRESS_COLLAPSE_MIN`, `TIER_EVICTION_SWEEP_MS` |

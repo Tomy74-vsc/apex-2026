@@ -1,6 +1,6 @@
 /**
- * Phase B — Pre-AIBrain gates (roadmapv4 1C subset).
- * Cheap filters before GraduationPredictor + Kelly (velocity window, trivial tx ratio).
+ * Phase B — filtres d’entrée complémentaires (avant AIBrain).
+ * Les vétos APEX §5 (V1–V5) sont dans GraduationPredictor.predict().
  */
 
 import type { CurveTradeEvent, TrackedCurve } from '../../types/bonding-curve.js';

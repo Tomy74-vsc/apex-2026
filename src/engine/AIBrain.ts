@@ -278,12 +278,14 @@ export class AIBrain extends EventEmitter {
     curve: TrackedCurve,
     trades: CurveTradeEvent[],
     socialScore = 0,
+    grokEnriched = false,
   ): CurveDecision {
     const t0 = performance.now();
     this.stats.curveDecisions++;
 
-    const prediction = this.graduationPredictor.predict(curve, trades, socialScore);
+    const prediction = this.graduationPredictor.predict(curve, trades, socialScore, grokEnriched);
 
+    /** APEX §7 — multiplicateur sur f* (0.25 = quarter-Kelly). */
     const kellyEta = parseFloat(process.env.KELLY_FRACTION ?? '0.25');
     const maxPositionPct = parseFloat(process.env.MAX_POSITION_PCT ?? '0.05');
     const minPositionSol = parseFloat(process.env.MIN_POSITION_SOL ?? '0.05');
@@ -296,19 +298,21 @@ export class AIBrain extends EventEmitter {
 
     if (action === 'ENTER_CURVE') {
       const realSolLamports = BigInt(Math.round(curve.realSolSOL * Number(LAMPORTS_PER_SOL_BIG)));
-      const priceMultiple = calcExpectedReturnOnGraduation(realSolLamports);
-      const b = Math.max(0, priceMultiple - 1);
+      const M = calcExpectedReturnOnGraduation(realSolLamports);
+      const b = Math.max(0, M - 1);
       const p = prediction.pGrad;
       const q = 1 - p;
       const fStar = b > 1e-9 ? (b * p - q) / b : 0;
-      const fCap = Math.max(0, fStar * kellyEta);
+      const fApplied = Math.max(0, fStar * kellyEta);
 
-      if (fCap < minKellyFrac) {
+      if (fApplied < minKellyFrac) {
         action = 'SKIP';
       } else {
-        const rawSol = bankroll * Math.min(fCap, maxPositionPct);
-        const capSol = Math.min(bankroll * maxPositionPct, maxPositionSol);
-        const sized = Math.min(rawSol, capSol);
+        const sized = Math.min(
+          fApplied * bankroll,
+          maxPositionSol,
+          bankroll * maxPositionPct,
+        );
         if (sized < minPositionSol) {
           action = 'SKIP';
         } else {
@@ -347,8 +351,23 @@ export class AIBrain extends EventEmitter {
   }
 
   /** Re-score pGrad for exit-engine time-stop (throttle in app.ts). */
-  curvePredictionPGrad(curve: TrackedCurve, trades: CurveTradeEvent[], socialScore = 0): number {
-    return this.graduationPredictor.predict(curve, trades, socialScore).pGrad;
+  curvePredictionPGrad(
+    curve: TrackedCurve,
+    trades: CurveTradeEvent[],
+    socialScore = 0,
+    grokEnriched = false,
+  ): number {
+    return this.graduationPredictor.predict(curve, trades, socialScore, grokEnriched).pGrad;
+  }
+
+  /** GraduationPredictor only — no Kelly / decision stats. Used for HOT observation snapshots. */
+  predictCurveOnly(
+    curve: TrackedCurve,
+    trades: CurveTradeEvent[],
+    socialScore = 0,
+    grokEnriched = false,
+  ): PredictionResult {
+    return this.graduationPredictor.predict(curve, trades, socialScore, grokEnriched);
   }
 
   graduationVetoStats(): Record<string, number> {

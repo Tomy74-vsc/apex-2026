@@ -7,6 +7,35 @@
 
 ---
 
+## SECTION 0 : RÉFÉRENCE UNIQUE — PROFIL SORTIE + SOCIAL
+
+### 0.1 Source de vérité
+
+Ce document est la **seule** référence chiffrée pour la stratégie quant (entrées, poids, sorties, env). `raodmap_final.md`, `roadmapv3.md`, `roadmapv4.md` et `PHASE_AB_VALIDATION.md` renvoient ici pour les nombres ; toute modification de paramètres prod passe par une mise à jour de **cette** section et de **§12**.
+
+### 0.2 Profil de sortie canonique : **Rotation agressive** (slots)
+
+**Décision (mars 2026) :** un seul profil par défaut — **Rotation** (directive `raodmap_final.md`, PROMPT 0) : libérer vite les **5 slots** face aux courbes stagnantes. Le profil historique **Conservation** (time stop ~10 min, stall plus lent) n’est **pas** le défaut repo ; il reste disponible uniquement en relevant volontairement les variables d’§12.
+
+| Paramètre | Rotation (défaut) | Conservation (optionnel) |
+|-----------|-------------------|---------------------------|
+| `TIME_STOP_SECONDS` | **300** | 600 |
+| `HARD_MAX_HOLD_SECONDS` | **300** (aucun bypass pGrad) | ≥ 600 |
+| `STALL_DURATION_SECONDS` | **90** | 120 |
+| `STALL_SOL_FLOW_MIN` | **0.05** | 0.1 |
+| `EXIT_EVAL_COOLDOWN_MS` | **3000** | 3000–5000 |
+
+**Interaction hard / soft :** si `HARD_MAX_HOLD_SECONDS` ≤ `TIME_STOP_SECONDS`, la sortie à l’échéance est toujours **hard** (pas de prolongation via `livePGrad`). Pour autoriser le bypass pGrad après le soft stop tout en gardant un plafond absolu plus tard, fixer `TIME_STOP_SECONDS` < `HARD_MAX_HOLD_SECONDS` (ex. 300 / 420).
+
+### 0.3 Poids de scoring : **fixes APEX** ; signal social **dynamique**
+
+**Décision :** les coefficients **wᵢ** de la §5 (dont **0.07** pour le social) restent **constants** dans `GraduationPredictor` — c’est le comportement **prod** actuel et aligné Marino.
+
+- **Dynamique** : uniquement la **valeur** du signal social dans `[0,1]` (ex. `SentimentAggregator.computeComposite` mélangeant Grok / Telegram / Dex quand câblés), pas les poids eux-mêmes.
+- **Non retenu sans spec + code** : redistribution dynamique des wᵢ (ex. augmenter le poids social quand la narrative explose). Si implémenté plus tard : feature flag explicite, tests, et mise à jour de **cette** section + §5.
+
+---
+
 ## SECTION 1 : POURQUOI 99% DES BOTS PERDENT DE L'ARGENT
 
 Le taux de graduation Pump.fun est de **~1.15% en mars 2026** (source : Dune Analytics/Cryptopolitan). Cela signifie que sur 100 tokens, environ 1 seul atteindra les ~85 SOL dans sa bonding curve et migrera vers PumpSwap.
@@ -205,6 +234,8 @@ L'edge doit être STRICTEMENT POSITIF pour entrer. Plus l'edge est grand, plus l
 | **Social Signal** | **0.07** | `grokXScore × 0.5 + telegramScore × 0.3 + dexScreenerBoost × 0.2` | Attention externe |
 | **Progress Sigmoid** | **0.05** | `1 / (1 + e^(-12 × (progress - 0.55)))` | Prior bayésien sur l'avancement |
 
+*Impl. social :* `SentimentAggregator.computeComposite` produit un score **[0,1] dynamique** qui est multiplié par le poids **fixe** 0.07 (voir **§0.3** — pas de w_social variable en prod sans nouveau gate).
+
 ### Pourquoi ces poids spécifiques
 
 Le papier de Marino montre quantitativement que le trading intensity est la seule variable qui **pousse systématiquement** la probabilité conditionnelle au-dessus de la courbe de breakeven, sur TOUTE la gamme de vSol. Les bots, le smart money, et le créateur sont des filtres/modulateurs — pas des prédicteurs primaires.
@@ -239,7 +270,7 @@ safety_margin(confidence) = 1 + (1 - confidence) × 0.8
 | 0.80 (bon signal) | 1.16× | Marge de 16% |
 | 0.95 (ML model trained) | 1.04× | Quasiment au breakeven |
 
-**Avec notre heuristique actuelle (confidence ~0.35) :** safety_margin ≈ 1.52×
+**Heuristique sans trades (confidence 0.15 dans le code) :** safety_margin ≈ 1.68×
 
 Ce qui veut dire qu'à 45 SOL (breakeven = 39%), on exige pGrad > 59% pour entrer. C'est TRÈS sélectif — et c'est voulu. On préfère manquer 10 opportunités que de perdre sur 1.
 
@@ -288,6 +319,8 @@ position_SOL = min(
 )
 ```
 
+*Impl. `AIBrain.decideCurve` :* `M = calcExpectedReturnOnGraduation(realSol)` (multiple prix entry→grad), `b = M - 1`, `f* = (b×p − q)/b`, puis `position_SOL = min(f* × KELLY_FRACTION × bankroll, MAX_POSITION_SOL, bankroll × MAX_POSITION_PCT)` avec `KELLY_FRACTION` défaut 0.25 (quarter-Kelly).
+
 ### Exemple numérique
 
 ```
@@ -310,27 +343,32 @@ Token à 45 SOL (65% progress) :
 
 ---
 
-## SECTION 8 : STRATÉGIE DE SORTIE — 6 RÈGLES EN CASCADE
+## SECTION 8 : STRATÉGIE DE SORTIE — CASCADE (IMPL EXITENGINE)
 
-### Hiérarchie de sortie (ordre d'évaluation)
+### Hiérarchie de sortie (ordre réel dans le code)
+
+Ordre d’évaluation `ExitEngine.evaluate()` :
 
 ```
-1. GRADUATION       → 3 tranches (40% / 35% / 25%)
-2. STOP-LOSS        → Sell 100% si PnL < -15%
-3. TRAILING STOP    → Sell 100% si price drop > 20% du peak (et profit > 10%)
-4. VELOCITY COLLAPSE → Sell 100% si v < 0.1 SOL/min pendant 2 minutes
-5. TIME STOP        → Sell 100% si holdTime > 10 minutes et pGrad < 50%
-6. TAKE PROFIT      → Sell 50% à +50% PnL, trailing 15% sur le reste
+1. GRADUATION        → 3 tranches (40% / 35% / 25%) si courbe complète / progress ≥ 0.99
+2. STOP-LOSS         → Sell 100% si PnL < -15%
+3. PROGRESS REGRESSION → Sell 100% si progress actuel < progress à l’entrée − 10 points
+4. HARD TIME STOP    → Sell 100% si hold > HARD_MAX_HOLD_SECONDS (aucun bypass pGrad)
+5. (cooldown eval)   → puis trailing, collapse, stall, soft time, take profit
+6. TRAILING STOP     → Sell 100% si drawdown depuis peak > 20% (après profit > 10%)
+7. VELOCITY COLLAPSE → Sell 100% si ratio/accel collapse + flux faible (seuil stall)
+8. STALL             → Sell 100% si solPerMinute_1m < STALL_SOL_FLOW_MIN pendant STALL_DURATION_SECONDS
+9. TIME STOP (soft)  → Sell 100% si hold > TIME_STOP_SECONDS et (pas de livePGrad ou livePGrad < TIME_STOP_MIN_PGRAD)
+10. TAKE PROFIT      → Sell 50% si PnL > +50% et momentum faible
 ```
 
-### Pourquoi 10 minutes et pas 2 heures de time stop
+**Défauts code (profil Rotation §0.2) :** `TIME_STOP_SECONDS` **300**, `HARD_MAX_HOLD_SECONDS` **300**, `STALL_SOL_FLOW_MIN` **0.05**, `STALL_DURATION_SECONDS` **90**, `TIME_STOP_MIN_PGRAD` **0.5**, `EXIT_EVAL_COOLDOWN_MS` **3000**.
 
-L'analyse des données Pump.fun montre que :
-- Les tokens qui graduent le font généralement en **5-30 minutes** après avoir atteint 50% progress
-- Si un token est en HOT depuis > 10 minutes sans graduation et que le momentum faiblit, la probabilité conditionnelle chute drastiquement
-- 94% des tokens Pump.fun "meurent" en moins de 60 minutes
+### Pourquoi 5 minutes (Rotation) plutôt que 10+ minutes
 
-Garder une position 2h sur un token qui stagne est un coût d'opportunité massif — ce capital bloqué pourrait être sur un nouveau token avec meilleur momentum.
+Les courbes qui graduent le font souvent en **5–30 min** après la zone sweet spot ; au-delà, le risque de stagnation et le **coût d’opportunité sur 5 slots** dominent. Le profil **Rotation** coupe à **300 s** (hard + soft alignés par défaut) pour forcer le recyclage du capital. Le profil **Conservation** (~600 s / stall plus lent) reste documenté en §0.2 pour runs où la pression slots est moindre.
+
+**Note :** l’ancienne rédaction « 10 minutes » décrivait le profil Conservation ; elle n’est plus le défaut repo.
 
 ### Exit sur graduation : la stratégie 3 tranches
 
@@ -543,13 +581,18 @@ MIN_TRADING_INTENSITY=0.15
 MIN_TRADE_COUNT=10
 SAFETY_MARGIN_BASE=1.50
 
-# ═══ Sortie ═══
+# ═══ Sortie — profil Rotation (défaut §0.2) ═══
 STOP_LOSS_PCT=0.15
 TRAILING_STOP_PCT=0.20
 TAKE_PROFIT_PCT=0.50
-TIME_STOP_SECONDS=600
-STALL_VELOCITY_THRESHOLD=0.10
-STALL_DURATION_SECONDS=120
+TIME_STOP_SECONDS=300
+HARD_MAX_HOLD_SECONDS=300
+STALL_SOL_FLOW_MIN=0.05
+STALL_DURATION_SECONDS=90
+EXIT_EVAL_COOLDOWN_MS=3000
+TIME_STOP_MIN_PGRAD=0.50
+# Réservé (non lu par ExitEngine aujourd’hui — évolutions StallDetector / Tiered)
+STALL_VELOCITY_THRESHOLD=0.15
 
 # ═══ Graduation Exit (3 tranches) ═══
 GRAD_T1_PCT=0.40

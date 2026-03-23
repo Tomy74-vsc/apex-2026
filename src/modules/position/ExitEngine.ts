@@ -5,6 +5,7 @@ import type { VelocitySignal } from '../graduation-predictor/VelocityAnalyzer.js
 export type ExitReason =
   | 'graduation'
   | 'stop_loss'
+  | 'progress_regression'
   | 'trailing_stop'
   | 'stall'
   | 'time_stop'
@@ -54,19 +55,19 @@ export function getExitEngine(): ExitEngine {
 
 /**
  * Exit rule cascade — single pass, no allocations except returned ExitSignal.
- * Phase B: sustained stall window, TIME_STOP_SECONDS, optional livePGrad time-stop bypass.
+ * Defaults alignés APEX_QUANT_STRATEGY §0.2 + §8 — profil Rotation (300s, stall 0.05 SOL/min × 90s).
  */
 export class ExitEngine {
   private readonly stopLossPct: number;
   private readonly trailingStopPct: number;
   private readonly takeProfitPct: number;
   private readonly maxHoldMs: number;
-  private readonly stallVelocityThreshold: number;
   private readonly stallSolFlowMin: number;
   private readonly stallDurationMs: number;
   private readonly velocityCollapseRatio: number;
   private readonly minCooldownMs: number;
   private readonly timeStopMinPGrad: number;
+  private readonly hardMaxHoldMs: number;
   private readonly lastEvalMs: Map<string, number> = new Map();
   private readonly stallLowSince: Map<string, number> = new Map();
 
@@ -74,26 +75,24 @@ export class ExitEngine {
     this.stopLossPct = envFloat('STOP_LOSS_PCT', 0.15);
     this.trailingStopPct = envFloat('TRAILING_STOP_PCT', 0.2);
     this.takeProfitPct = envFloat('TAKE_PROFIT_PCT', 0.5);
-    const ts = process.env.TIME_STOP_SECONDS;
-    if (ts !== undefined && ts !== '') {
-      const sec = parseInt(ts, 10);
-      this.maxHoldMs =
-        Number.isFinite(sec) && sec > 0 ? sec * 1000 : envInt('MAX_HOLD_TIME_MINUTES', 10) * 60_000;
-    } else {
+    if (process.env.MAX_HOLD_TIME_MINUTES !== undefined && process.env.MAX_HOLD_TIME_MINUTES !== '') {
       this.maxHoldMs = envInt('MAX_HOLD_TIME_MINUTES', 10) * 60_000;
+    } else {
+      this.maxHoldMs = envInt('TIME_STOP_SECONDS', 300) * 1000;
     }
-    this.stallVelocityThreshold = envFloat('STALL_VELOCITY_THRESHOLD', 0.1);
-    this.stallSolFlowMin = envFloat('STALL_SOL_FLOW_MIN', 0.1);
-    this.stallDurationMs = envInt('STALL_DURATION_SECONDS', 120) * 1000;
+    this.hardMaxHoldMs = envInt('HARD_MAX_HOLD_SECONDS', 300) * 1000;
+    this.stallSolFlowMin = envFloat('STALL_SOL_FLOW_MIN', 0.05);
+    this.stallDurationMs = envInt('STALL_DURATION_SECONDS', 90) * 1000;
     this.velocityCollapseRatio = envFloat('VELOCITY_COLLAPSE_RATIO', 0.3);
-    this.minCooldownMs = envInt('EXIT_EVAL_COOLDOWN_MS', 5_000);
+    this.minCooldownMs = envInt('EXIT_EVAL_COOLDOWN_MS', 3_000);
     this.timeStopMinPGrad = envFloat('TIME_STOP_MIN_PGRAD', 0.5);
 
     console.log(
       `🛡️ [ExitEngine] SL=${(this.stopLossPct * 100).toFixed(0)}% trail=${(this.trailingStopPct * 100).toFixed(0)}% ` +
-        `TP=${(this.takeProfitPct * 100).toFixed(0)}% maxHold=${(this.maxHoldMs / 1000).toFixed(0)}s ` +
-        `stallV=${this.stallVelocityThreshold} stallSOL=${this.stallSolFlowMin}/min stallDur=${(this.stallDurationMs / 1000).toFixed(0)}s ` +
-        `timeStopSkipPGrad≥${this.timeStopMinPGrad} cooldown=${this.minCooldownMs}ms`,
+        `TP=${(this.takeProfitPct * 100).toFixed(0)}% softTime=${(this.maxHoldMs / 1000).toFixed(0)}s ` +
+        `hardMax=${(this.hardMaxHoldMs / 1000).toFixed(0)}s (NO BYPASS) ` +
+        `stallSOL<${this.stallSolFlowMin}/min ×${(this.stallDurationMs / 1000).toFixed(0)}s ` +
+        `collapseRatio=${this.velocityCollapseRatio} timeStopSkipPGrad≥${this.timeStopMinPGrad} cooldown=${this.minCooldownMs}ms`,
     );
   }
 
@@ -119,6 +118,32 @@ export class ExitEngine {
       return this.sig(mint, 'stop_loss', 'SELL_100PCT', 'CRITICAL', `pnl ${(pnlPct * 100).toFixed(2)}% < -${(this.stopLossPct * 100).toFixed(0)}%`, pnlPct);
     }
 
+    if (position.currentProgress < position.entryProgress - 0.1) {
+      this.lastEvalMs.set(mint, now);
+      this.stallLowSince.delete(mint);
+      return this.sig(
+        mint,
+        'progress_regression',
+        'SELL_100PCT',
+        'HIGH',
+        `progress ${(position.entryProgress * 100).toFixed(0)}% → ${(position.currentProgress * 100).toFixed(0)}%`,
+        pnlPct,
+      );
+    }
+
+    if (now - position.entryTimestamp > this.hardMaxHoldMs) {
+      this.lastEvalMs.set(mint, now);
+      this.stallLowSince.delete(mint);
+      return this.sig(
+        mint,
+        'time_stop',
+        'SELL_100PCT',
+        'CRITICAL',
+        `HARD time stop: held > ${(this.hardMaxHoldMs / 1000).toFixed(0)}s (NO bypass)`,
+        pnlPct,
+      );
+    }
+
     const last = this.lastEvalMs.get(mint) ?? 0;
     if (now - last < this.minCooldownMs) {
       return null;
@@ -137,11 +162,7 @@ export class ExitEngine {
       );
     }
 
-    const hasMicro =
-      velocity.tradesToReachCurrentLevel > 0 || velocity.peakVelocity_5m > 1e-6;
-
     if (
-      hasMicro &&
       velocity.velocityRatio < this.velocityCollapseRatio &&
       velocity.velocityAcceleration < -0.5 &&
       velocity.solPerMinute_1m < this.stallSolFlowMin
@@ -152,7 +173,7 @@ export class ExitEngine {
       }
     }
 
-    if (hasMicro && velocity.velocityRatio < this.stallVelocityThreshold && velocity.solPerMinute_1m < this.stallSolFlowMin) {
+    if (velocity.solPerMinute_1m < this.stallSolFlowMin) {
       const t0 = this.stallLowSince.get(mint);
       if (t0 === undefined) {
         this.stallLowSince.set(mint, now);
@@ -163,7 +184,7 @@ export class ExitEngine {
           'stall',
           'SELL_100PCT',
           'MEDIUM',
-          `low v ${(this.stallDurationMs / 1000).toFixed(0)}s+`,
+          `sol/min ${velocity.solPerMinute_1m.toFixed(3)} < ${this.stallSolFlowMin} for ${(this.stallDurationMs / 1000).toFixed(0)}s+`,
           pnlPct,
         );
       }
@@ -188,7 +209,7 @@ export class ExitEngine {
       }
     }
 
-    if (hasMicro && pnlPct > this.takeProfitPct && velocity.velocityRatio < 0.5) {
+    if (pnlPct > this.takeProfitPct && velocity.velocityRatio < 0.5) {
       return this.sig(mint, 'take_profit', 'SELL_50PCT', 'MEDIUM', `tp ${(pnlPct * 100).toFixed(1)}% + weak momentum`, pnlPct);
     }
 

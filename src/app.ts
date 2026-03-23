@@ -16,20 +16,32 @@ import { Keypair } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { DecisionCore } from './engine/DecisionCore.js';
 import { TelegramPulse } from './ingestors/TelegramPulse.js';
+import {
+  getTelegramTokenScanner,
+  type TelegramTokenScanResult,
+} from './ingestors/TelegramTokenScanner.js';
 import { PumpScanner } from './ingestors/PumpScanner.js';
+import { getSocialTrendScanner } from './ingestors/SocialTrendScanner.js';
 import { Sniper } from './executor/Sniper.js';
 import { getFeatureStore } from './data/FeatureStore.js';
+import { getWhaleWalletDB } from './data/WhaleWalletDB.js';
 import { getPriceTracker } from './data/PriceTracker.js';
 import { getAIBrain } from './engine/AIBrain.js';
 import { getModelUpdater } from './engine/ModelUpdater.js';
 import { getShadowAgent } from './engine/ShadowAgent.js';
 import { getCurveTracker } from './modules/curve-tracker/CurveTracker.js';
+import type { CurveEvictionSnapshot } from './modules/curve-tracker/TieredMonitor.js';
 import { CurveExecutor } from './modules/curve-executor/CurveExecutor.js';
 import { GraduationExitStrategy } from './modules/curve-executor/GraduationExitStrategy.js';
 import { getPositionManager } from './modules/position/PositionManager.js';
 import { getExitEngine } from './modules/position/ExitEngine.js';
 import { getCurveVelocityAnalyzer } from './modules/position/curveVelocitySingleton.js';
 import { attachPaperTradeLogger } from './modules/position/PaperTradeLogger.js';
+import { getGrokXScanner } from './social/GrokXScanner.js';
+import { getNarrativeRadar } from './social/NarrativeRadar.js';
+import { getSentimentAggregator } from './social/SentimentAggregator.js';
+import { getViralityScorer } from './nlp/ViralityScorer.js';
+import { getNLPPipeline } from './nlp/NLPPipeline.js';
 import type { TrackedCurve } from './types/bonding-curve.js';
 import type {
   ScoredToken,
@@ -104,6 +116,13 @@ class APEXBot {
   private readonly livePGradRefreshMs = parseInt(process.env.LIVE_PGRAD_REFRESH_MS ?? '20000', 10) || 20_000;
   private curveLivePGradLastAt = new Map<string, number>();
   private curveLivePGradCache = new Map<string, number>();
+  /** Phase C — reuse Grok/social on curveUpdate (same TTL as GROK_TOKEN_CACHE_TTL_MS). */
+  private curveSocialScoreCache = new Map<
+    string,
+    { score: number; grokEnriched: boolean; at: number }
+  >();
+  private readonly SOCIAL_SCORE_TTL_MS =
+    parseInt(process.env.GROK_TOKEN_CACHE_TTL_MS ?? '900000', 10) || 900_000;
 
   constructor(config: AppConfig) {
     this.strategyMode = process.env.STRATEGY_MODE ?? 'legacy';
@@ -289,8 +308,32 @@ class APEXBot {
     // Événement : Signal Telegram détecté
     if (this.telegramPulse) {
       this.telegramPulse.on('newSignal', (signal) => {
+        const raw = signal.rawText ?? '';
+        const tNlp = performance.now();
+        void (async () => {
+          try {
+            const pipeline = getNLPPipeline();
+            const vir = getViralityScorer();
+            const nlpSig = await pipeline.process(raw, signal.mint, 'Telegram', 58, 800, {
+              deferVirality: true,
+            });
+            vir.addMention({
+              mint: signal.mint,
+              platform: 'Telegram',
+              authorTrustScore: 58,
+              reach: 800,
+              sentiment: nlpSig.sentiment,
+              timestamp: signal.timestamp,
+            });
+            console.log(
+              `📨 [Telegram→NLP] ${signal.mint.slice(0, 8)}… cat=${nlpSig.category} ` +
+                `sent=${nlpSig.sentiment.toFixed(2)} ⏱️${(performance.now() - tNlp).toFixed(0)}ms`,
+            );
+          } catch {
+            /* cold path — event loop safe */
+          }
+        })();
         console.log(`📨 TELEGRAM SIGNAL: ${signal.mint} (score: ${signal.score})`);
-        // Émet tokenDetected pour déclencher l'analyse
         this.decisionCore.emit('tokenDetected', signal.mint);
         this.stats.tokensDetected++;
       });
@@ -339,6 +382,22 @@ class APEXBot {
 
       attachPaperTradeLogger();
 
+      getSocialTrendScanner().on('socialBoost', ({ mint }) => {
+        try {
+          const ct = getCurveTracker();
+          const existing = ct.getCurveState(mint);
+          if (existing && existing.tier !== 'hot') {
+            ct.forcePromoteHot(mint);
+          }
+          const curve = ct.getCurveState(mint);
+          if (curve?.tier === 'hot') {
+            void this.fetchAndCacheCurveSocialScore(curve).catch(() => {});
+          }
+        } catch {
+          /* cold path */
+        }
+      });
+
       getPositionManager().on('positionClosed', (p) => {
         this.decisionCore.updateActivePositions(-1);
         this.curveLivePGradCache.delete(p.mint);
@@ -352,7 +411,15 @@ class APEXBot {
             return;
           }
           const trades = curveTracker.getTradeHistory(mint);
-          const decision = await this.decisionCore.processCurveEvent(curve, trades);
+          const { score: socialScore, grokEnriched } = await this.fetchAndCacheCurveSocialScore(
+            curve,
+          ).catch(() => ({ score: 0, grokEnriched: false }));
+          const decision = await this.decisionCore.processCurveEvent(
+            curve,
+            trades,
+            socialScore,
+            grokEnriched,
+          );
 
           if (decision?.action === 'ENTER_CURVE' && this.curveExecutor) {
             this.decisionCore.updateActivePositions(+1);
@@ -391,18 +458,25 @@ class APEXBot {
       curveTracker.on('curveUpdate', async (mint: string, curve: TrackedCurve) => {
         const pm = getPositionManager();
         try {
+          const trades = curveTracker.getTradeHistory(mint);
+          // ML : un snapshot HOT à chaque poll (sans cooldown predictor), avant exit/entry.
+          if (curve.tier === 'hot') {
+            const { score: obsSocial, grokEnriched: obsGrok } = this.getCachedCurveSocial(mint);
+            this.decisionCore.appendHotObservationSnapshot(curve, trades, obsSocial, obsGrok);
+          }
+
           if (pm.hasOpenPosition(mint) && this.curveExecutor) {
             pm.updatePosition(mint, curve);
             const pos = pm.getPosition(mint);
             if (pos?.status === 'OPEN') {
-              const trades = curveTracker.getTradeHistory(mint);
               const velocity = getCurveVelocityAnalyzer().analyze(mint, trades);
               const nowTs = Date.now();
               let livePGrad: number | undefined = this.curveLivePGradCache.get(mint);
               const lastPg = this.curveLivePGradLastAt.get(mint) ?? 0;
+              const { score: pgSocial, grokEnriched: pgGrok } = this.getCachedCurveSocial(mint);
               if (nowTs - lastPg >= this.livePGradRefreshMs) {
                 try {
-                  livePGrad = getAIBrain().curvePredictionPGrad(curve, trades, 0);
+                  livePGrad = getAIBrain().curvePredictionPGrad(curve, trades, pgSocial, pgGrok);
                   this.curveLivePGradCache.set(mint, livePGrad);
                   this.curveLivePGradLastAt.set(mint, nowTs);
                 } catch {
@@ -449,8 +523,8 @@ class APEXBot {
           }
 
           if (!pm.hasOpenPosition(mint) && curve.tier === 'hot') {
-            const trades = curveTracker.getTradeHistory(mint);
-            await this.decisionCore.processCurveEvent(curve, trades);
+            const { score: socialScore, grokEnriched } = this.getCachedCurveSocial(mint);
+            await this.decisionCore.processCurveEvent(curve, trades, socialScore, grokEnriched);
           }
         } catch {
           /* cold path */
@@ -482,32 +556,113 @@ class APEXBot {
             finalSol: curve.realSolSOL,
             durationS,
           });
+          this.enrichWhaleStatsFromCurveOutcome(mint, true);
         } catch {
           // silencieux
         }
       });
 
-      curveTracker.on('evicted', (mint: string, reason: string) => {
+      // Outcomes : TieredMonitor évince puis émet snap capturé AVANT delete (getCurveState sinon null).
+      curveTracker.on('evicted', (mint: string, reason: string, snap?: CurveEvictionSnapshot) => {
         try {
-          const curve = curveTracker.getCurveState(mint);
-          if (curve) {
-            getAIBrain().recordCreatorOutcome(curve.state.creator.toBase58(), false);
-            const durationS = (Date.now() - curve.createdAt) / 1_000;
-            getFeatureStore().labelCurveOutcome({
-              mint,
-              graduated: false,
-              finalProgress: curve.progress,
-              finalSol: curve.realSolSOL,
-              durationS,
-              evictionReason: reason,
-            });
+          if (snap?.creator) {
+            getAIBrain().recordCreatorOutcome(snap.creator, false);
           }
+          const durationS = snap ? (Date.now() - snap.createdAt) / 1_000 : 0;
+          getFeatureStore().labelCurveOutcome({
+            mint,
+            graduated: false,
+            finalProgress: snap?.progress ?? 0,
+            finalSol: snap?.realSol ?? 0,
+            durationS,
+            evictionReason: reason,
+          });
+          this.enrichWhaleStatsFromCurveOutcome(mint, false);
           this.decisionCore.clearCurveCooldown(mint);
         } catch {
           // silencieux
         }
       });
     }
+  }
+
+  /**
+   * Phase C — Grok X + narrative + virality → composite [0,1]. Never throws.
+   */
+  private async fetchAndCacheCurveSocialScore(curve: TrackedCurve): Promise<{
+    score: number;
+    grokEnriched: boolean;
+  }> {
+    const mint = curve.mint;
+    const meta = curve.metadata;
+    const ticker = (meta?.symbol ?? 'UNKNOWN').replace(/^\$/, '');
+
+    const grok = getGrokXScanner();
+    const xSentiment = grok.hasApiKey()
+      ? await grok.analyzeToken(ticker, mint).catch(() => null)
+      : null;
+    const grokEnriched = xSentiment != null;
+
+    const tgClient = this.telegramPulse?.getClient() ?? null;
+    let tgScan: TelegramTokenScanResult | null = null;
+    try {
+      tgScan = await getTelegramTokenScanner().analyzeMint(mint, meta, tgClient);
+    } catch {
+      tgScan = null;
+    }
+    const telegramChannelScore =
+      tgScan && tgScan.source !== 'none' && tgScan.compositeScore > 0 ? tgScan.compositeScore : null;
+
+    const narrativeMatch = getNarrativeRadar().matchesToken(meta?.name ?? '', ticker);
+    const viralityScore = getViralityScorer().getViralityScore(mint);
+    const dexBoosted = getSocialTrendScanner().isBoosted(mint);
+    let socialScore = getSentimentAggregator().computeComposite(
+      mint,
+      xSentiment,
+      telegramChannelScore,
+      viralityScore,
+      dexBoosted,
+    );
+    if (narrativeMatch && narrativeMatch.velocity >= 7) {
+      socialScore = Math.min(1, socialScore + 0.3);
+      console.log(
+        `📢 [Narrative] ${mint.slice(0, 8)}… matches "${narrativeMatch.theme}" v=${narrativeMatch.velocity} → social boosted`,
+      );
+    }
+
+    this.curveSocialScoreCache.set(mint, {
+      score: socialScore,
+      grokEnriched,
+      at: Date.now(),
+    });
+    return { score: socialScore, grokEnriched };
+  }
+
+  /** Enrichit whale_wallets pour les acheteurs early (courbes résolues). Cold path. */
+  private enrichWhaleStatsFromCurveOutcome(mint: string, graduated: boolean): void {
+    try {
+      const trades = getCurveTracker().getTradeHistory(mint);
+      const earlyBuyers = trades.filter((t) => t.isBuy).map((t) => t.trader);
+      const wdb = getWhaleWalletDB();
+      for (const buyer of new Set(earlyBuyers)) {
+        wdb.updateStats(buyer, graduated);
+      }
+    } catch {
+      /* cold path */
+    }
+  }
+
+  private getCachedCurveSocial(mint: string): { score: number; grokEnriched: boolean } {
+    const row = this.curveSocialScoreCache.get(mint);
+    const stale = !row || Date.now() - row.at > this.SOCIAL_SCORE_TTL_MS;
+    if (stale) {
+      return { score: 0, grokEnriched: false };
+    }
+    if (getSocialTrendScanner().isBoosted(mint)) {
+      const dexOnly = getSentimentAggregator().computeComposite(mint, null, null, 0, true);
+      return { score: Math.max(row.score, dexOnly), grokEnriched: row.grokEnriched };
+    }
+    return { score: row.score, grokEnriched: row.grokEnriched };
   }
 
   /**
@@ -544,7 +699,20 @@ class APEXBot {
           console.log('📈 Démarrage de CurveTracker...');
           await getCurveTracker().start();
           console.log('✅ CurveTracker démarré (mode: curve-prediction)\n');
+
+          if (!getGrokXScanner().hasApiKey()) {
+            console.log(
+              '⚠️ [Social] XAI_API_KEY unset — GrokX + NarrativeRadar off (bot OK sans couche X)\n',
+            );
+          }
+          void getNarrativeRadar()
+            .start()
+            .catch(() => {});
+
+          await getSocialTrendScanner().start();
+
           getFeatureStore();
+          getWhaleWalletDB().loadIntoSmartMoneyTracker();
           const restored = getPositionManager().restoreFromFeatureStore();
           if (restored > 0) {
             this.decisionCore.syncActiveCurveSlotCount(getPositionManager().getOpenCount());
@@ -570,6 +738,14 @@ class APEXBot {
 
       console.log('✅ Bot démarré avec succès!');
       console.log('📊 Tableau de bord mis à jour toutes les 60 secondes');
+      if (this.strategyMode === 'curve-prediction') {
+        console.log(
+          '📦 Collecte ML : snapshots HOT + outcomes grad/evict → `bun run export:ml` → data/*.csv (voir COLLECTION_RUNBOOK.md)',
+        );
+        console.log(
+          '💸 Infra $0 : RPC/WS publics + DexScreener + Groq NLP ; xAI/Telegram = optionnels (crédits / compte)',
+        );
+      }
       console.log('🛑 Appuyez sur Ctrl+C pour arrêter proprement\n');
 
       // TelegramPulse en dernier — peut bloquer sur input interactif (téléphone)
@@ -601,6 +777,16 @@ class APEXBot {
     console.log('\n\n🛑 Arrêt du bot en cours...');
 
     if (this.strategyMode === 'curve-prediction') {
+      try {
+        getNarrativeRadar().stop();
+      } catch {
+        /* silencieux */
+      }
+      try {
+        getSocialTrendScanner().stop();
+      } catch {
+        /* silencieux */
+      }
       try {
         getPositionManager().flushPersistenceSync();
         console.log('💾 [PositionManager] Open positions flushed to SQLite');

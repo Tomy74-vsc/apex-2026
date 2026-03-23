@@ -3,6 +3,7 @@ import { EventEmitter } from 'events';
 import { TieredMonitor } from './TieredMonitor.js';
 import { deriveBondingCurvePDA } from '../../types/bonding-curve.js';
 import type { TrackedCurve, CurveTradeEvent, BondingCurveState } from '../../types/bonding-curve.js';
+import type { CurveEvictionSnapshot } from './TieredMonitor.js';
 
 const MAX_TRADE_HISTORY = 500;
 
@@ -39,8 +40,8 @@ export class CurveTracker extends EventEmitter {
       this.emit('graduated', mint, curve);
       this.tradeHistory.delete(mint);
     });
-    this.tieredMonitor.on('evicted', (mint: string, reason: string) => {
-      this.emit('evicted', mint, reason);
+    this.tieredMonitor.on('evicted', (mint: string, reason: string, snap?: CurveEvictionSnapshot) => {
+      this.emit('evicted', mint, reason, snap);
       this.tradeHistory.delete(mint);
     });
 

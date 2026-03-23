@@ -55,6 +55,7 @@ export class NLPPipeline extends EventEmitter {
    * @param platform - Source platform
    * @param authorTrust - Author trust score (0-100)
    * @param reach - Author followers/channel members
+   * @param options.deferVirality — si true, n’appelle pas addMention (appelant doit appeler getViralityScorer().addMention, ex. horodatage Telegram)
    */
   async process(
     rawText: string,
@@ -62,6 +63,7 @@ export class NLPPipeline extends EventEmitter {
     platform: 'X' | 'Telegram' = 'Telegram',
     authorTrust: number = 50,
     reach: number = 100,
+    options?: { deferVirality?: boolean },
   ): Promise<NLPSignal> {
     const t0 = performance.now();
     this.stats.processed++;
@@ -76,7 +78,9 @@ export class NLPPipeline extends EventEmitter {
     if (s0.spamScore >= SPAM_THRESHOLD_SKIP_LLM) {
       this.stats.stage0Only++;
       const signal = this.buildSignal(effectiveMint, s0, null, 's0', t0);
-      this.emitMention(effectiveMint, platform, authorTrust, reach, signal.sentiment);
+      if (!options?.deferVirality) {
+        this.emitMention(effectiveMint, platform, authorTrust, reach, signal.sentiment);
+      }
       this.emit('nlpSignal', signal);
       return signal;
     }
@@ -105,7 +109,9 @@ export class NLPPipeline extends EventEmitter {
       effectiveMint, s0, finalSentiment, finalConfidence, finalCategory, pipeline, t0,
     );
 
-    this.emitMention(effectiveMint, platform, authorTrust, reach, finalSentiment);
+    if (!options?.deferVirality) {
+      this.emitMention(effectiveMint, platform, authorTrust, reach, finalSentiment);
+    }
     this.emit('nlpSignal', signal);
 
     return signal;

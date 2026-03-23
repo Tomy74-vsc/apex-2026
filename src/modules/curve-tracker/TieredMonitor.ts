@@ -27,6 +27,14 @@ const PROGRESS_COLLAPSE_MIN = parseInt(process.env.TIER_PROGRESS_COLLAPSE_MIN ??
 const HOT_PROGRESS_EPS = 0.01;
 const EVICTION_SWEEP_MS = parseInt(process.env.TIER_EVICTION_SWEEP_MS ?? '60000', 10) || 60_000;
 
+/** Captured before tier maps are cleared (for `curve_outcomes` / ML). */
+export interface CurveEvictionSnapshot {
+  progress: number;
+  realSol: number;
+  createdAt: number;
+  creator?: string;
+}
+
 export class TieredMonitor extends EventEmitter {
   readonly cold: Map<string, TrackedCurve> = new Map();
   readonly warm: Map<string, TrackedCurve> = new Map();
@@ -197,12 +205,21 @@ export class TieredMonitor extends EventEmitter {
   }
 
   private evict(mint: string, reason: string): void {
+    const curveState =
+      this.hot.get(mint) ?? this.warm.get(mint) ?? this.cold.get(mint);
+    const snap: CurveEvictionSnapshot = {
+      progress: curveState?.progress ?? 0,
+      realSol: curveState?.realSolSOL ?? 0,
+      createdAt: curveState?.createdAt ?? Date.now(),
+      creator: curveState ? curveState.state.creator.toBase58() : undefined,
+    };
+
     this.cold.delete(mint);
     this.warm.delete(mint);
     this.hot.delete(mint);
     this.batchPoller.unregister(mint);
     this.evictionCount++;
-    this.emit('evicted', mint, reason);
+    this.emit('evicted', mint, reason, snap);
   }
 
   private handleGraduation(mint: string, state: BondingCurveState): void {

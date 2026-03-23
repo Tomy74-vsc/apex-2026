@@ -82,6 +82,8 @@ export class GraduationPredictor {
     curve: TrackedCurve,
     trades: CurveTradeEvent[],
     socialScore = 0,
+    /** Réservé wiring app (social composite déjà fusionné dans socialScore). */
+    _grokEnriched = false,
   ): PredictionResult {
     const t0 = performance.now();
 
@@ -102,6 +104,9 @@ export class GraduationPredictor {
         t0,
       );
     }
+
+    /** APEX §6 — confiance scoring pondéré bornée [0.3, 0.8] (données trades). */
+    const confidenceWeighted = Math.min(0.8, 0.3 + 0.7 * Math.min(1, buyCount / 30));
 
     // ─── APEX §5 V1–V5 (ordre strict) puis gates roadmapv3 ─────────────
     let vetoReason: string | null = null;
@@ -148,15 +153,16 @@ export class GraduationPredictor {
       vetoBucket = 'velocity_ratio';
     }
 
-    const dataConfidence = Math.min(1, buyCount / 30);
-    const confidence = 0.3 + 0.7 * dataConfidence;
-    const { minPGrad, minPGradWithMargin } = calcBreakevenWithConfidence(realSolLamports, confidence);
+    const { minPGrad, minPGradWithMargin } = calcBreakevenWithConfidence(
+      realSolLamports,
+      confidenceWeighted,
+    );
 
     if (vetoReason && vetoBucket) {
       this.bumpVeto(vetoBucket);
       return {
         pGrad: 0,
-        confidence: 0.9,
+        confidence: confidenceWeighted,
         action: 'SKIP',
         vetoReason,
         breakeven: minPGrad,
@@ -172,7 +178,7 @@ export class GraduationPredictor {
     const velocityMomentumScore =
       Math.min(1, velocity.solPerMinute_1m / 3.0) * Math.max(0, Math.min(1, velocity.velocityRatio));
     const antiBotScore = 1 - botSignal.botTransactionRatio;
-    // APEX §5 holder quality: (1 − fresh) × (1 − top10 concentration proxy)
+    // APEX §5 holder quality: (1 − fresh) × (1 − top10Concentration/100); top10BuyVolumeShare est déjà 0–1
     const holderScore = Math.max(
       0,
       Math.min(
@@ -184,7 +190,7 @@ export class GraduationPredictor {
     const socialNorm = Math.max(0, Math.min(1, socialScore));
     const progressSigmoid = 1 / (1 + Math.exp(-12 * (curve.progress - 0.55)));
 
-    const pGrad =
+    const numer =
       W_TRADING_INTENSITY * tradingIntensityScore +
       W_VELOCITY_MOMENTUM * velocityMomentumScore +
       W_ANTI_BOT * antiBotScore +
@@ -192,6 +198,17 @@ export class GraduationPredictor {
       W_SMART_MONEY * smartMoneyScore +
       W_SOCIAL * socialNorm +
       W_PROGRESS_SIGMOID * progressSigmoid;
+
+    const denom =
+      W_TRADING_INTENSITY +
+      W_VELOCITY_MOMENTUM +
+      W_ANTI_BOT +
+      W_HOLDER +
+      W_SMART_MONEY +
+      W_SOCIAL +
+      W_PROGRESS_SIGMOID;
+
+    const pGrad = denom > 0 ? numer / denom : 0;
 
     const safetyMarginMet = pGrad > minPGradWithMargin;
     const action = safetyMarginMet ? 'ENTER_CURVE' : 'SKIP';
@@ -209,7 +226,7 @@ export class GraduationPredictor {
 
     return {
       pGrad,
-      confidence,
+      confidence: confidenceWeighted,
       action,
       vetoReason: safetyMarginMet ? null : `pGrad ${(pGrad * 100).toFixed(1)}% ≤ ${(minPGradWithMargin * 100).toFixed(1)}%`,
       breakeven: minPGrad,
@@ -229,8 +246,8 @@ export class GraduationPredictor {
     walletScore: WalletScore,
     t0: number,
   ): PredictionResult {
-    /** APEX_QUANT_STRATEGY §6 — heuristique ~0.35 ⇒ safety_margin ≈ 1.52× */
-    const confidence = 0.35;
+    /** APEX §6 — heuristique sans trades : confiance basse ⇒ safety_margin ≈ 1.68× */
+    const confidence = 0.15;
     const { minPGrad, minPGradWithMargin } = calcBreakevenWithConfidence(realSolLamports, confidence);
 
     const pMin = CURVE_ENTRY_MIN_PROGRESS();

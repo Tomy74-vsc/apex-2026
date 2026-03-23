@@ -12,7 +12,9 @@
     "typecheck": "tsc --noEmit",
     "verify:runtime": "bun --version",
     "verify:deps": "bun outdated",
-    "verify": "bun --version && bun run typecheck"
+    "verify": "bun --version && bun run typecheck",
+    "export:ml": "bun scripts/export-ml-dataset.ts",
+    "seed:whales": "bun scripts/seed-whales.ts"
   },
   "devDependencies": {
     "@types/bun": "1.3.10",

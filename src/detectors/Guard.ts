@@ -3,6 +3,10 @@ import { getMint, getAccount, TokenAccountNotFoundError, TokenInvalidAccountOwne
 import { createJupiterApiClient, type QuoteResponse, type SwapResponse } from '@jup-ag/api';
 import type { SecurityReport } from '../types/index.js';
 import type { TrackedCurve } from '../types/bonding-curve.js';
+import {
+  readCurveEntryMaxProgress,
+  readCurveEntryMinProgress,
+} from '../constants/curve-entry-bands.js';
 
 export interface CurveGuardResult {
   allowed: boolean;
@@ -594,8 +598,8 @@ export class Guard {
     activePositions: number,
   ): CurveGuardResult {
     const flags: string[] = [];
-    const minProgress = parseFloat(process.env.CURVE_ENTRY_MIN_PROGRESS ?? '0.50');
-    const maxProgress = parseFloat(process.env.CURVE_ENTRY_MAX_PROGRESS ?? '0.80');
+    const minProgress = readCurveEntryMinProgress();
+    const maxProgress = readCurveEntryMaxProgress();
     const maxPositions = parseInt(process.env.MAX_CONCURRENT_CURVE_POSITIONS ?? '5');
 
     if (curve.state.complete) {

@@ -112,6 +112,63 @@ export class TieredMonitor extends EventEmitter {
     this.batchPoller.register(mint, bondingCurvePDA);
   }
 
+  /**
+   * Pre-alert narrative watchlist : évite COLD, démarre en WARM (polling warm/hot sans forcer HOT).
+   */
+  registerDirectWarm(
+    mint: string,
+    bondingCurvePDA: PublicKey,
+    creator: PublicKey,
+    metadata?: { name?: string; symbol?: string; uri?: string },
+    initialState?: BondingCurveState,
+    narrativeMatch = false,
+  ): void {
+    if (this.cold.has(mint) || this.warm.has(mint) || this.hot.has(mint)) return;
+
+    this.enforceCapacity(this.warm, MAX_WARM);
+
+    const defaultState: BondingCurveState = {
+      virtualTokenReserves: 0n,
+      virtualSolReserves: 0n,
+      realTokenReserves: 0n,
+      realSolReserves: 0n,
+      tokenTotalSupply: 0n,
+      complete: false,
+      creator,
+      isMayhemMode: false,
+    };
+
+    const state = initialState ?? defaultState;
+    const progress = initialState ? calcProgress(state.realTokenReserves) : 0;
+    const realSolSOL = initialState ? Number(state.realSolReserves) / LAMPORTS_PER_SOL : 0;
+
+    const now = Date.now();
+    const curve: TrackedCurve = {
+      mint,
+      bondingCurvePDA,
+      state,
+      progress,
+      realSolSOL,
+      priceSOL: initialState ? calcPricePerToken(state.virtualSolReserves, state.virtualTokenReserves) : 0,
+      marketCapSOL: initialState ? calcMarketCapSOL(state.virtualSolReserves, state.virtualTokenReserves) : 0,
+      isKOTH: realSolSOL >= KOTH_SOL_THRESHOLD,
+      createdAt: now,
+      lastUpdated: now,
+      tier: 'warm',
+      tradeCount: 0,
+      metadata: metadata ?? {},
+      lastProgressChangeAt: now,
+      narrativeMatch: narrativeMatch ? true : undefined,
+    };
+
+    this.warm.set(mint, curve);
+    this.batchPoller.register(mint, bondingCurvePDA);
+    console.log(
+      `📡 [TieredMonitor] ${mint.slice(0, 8)}… registered WARM (skip COLD${narrativeMatch ? ', narrativeMatch' : ''})`,
+    );
+    this.emit('enterWarmZone', mint, curve);
+  }
+
   // ─── Tier promotion / demotion ─────────────────────────────────────────────
 
   promoteCurve(mint: string, newProgress: number): void {

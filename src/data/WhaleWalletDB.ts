@@ -7,6 +7,23 @@ import type { Database } from 'bun:sqlite';
 import { getFeatureStore } from './FeatureStore.js';
 import { getSmartMoneyTracker, type WalletProfile } from '../ingestors/SmartMoneyTracker.js';
 import { getAIBrain } from '../engine/AIBrain.js';
+import type { CurveTradeEvent } from '../types/bonding-curve.js';
+
+const RESERVE_FLOW_TRADER = '_reserve_flow';
+
+function envFloat(key: string, def: number): number {
+  const v = process.env[key];
+  if (v === undefined || v === '') return def;
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : def;
+}
+
+function envInt(key: string, def: number): number {
+  const v = process.env[key];
+  if (v === undefined || v === '') return def;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : def;
+}
 
 export interface WhaleWallet {
   address: string;
@@ -32,6 +49,62 @@ export function getWhaleWalletDB(): WhaleWalletDB {
 
 export class WhaleWalletDB {
   constructor(private readonly db: Database) {}
+
+  /**
+   * Enregistre un acheteur observé (cold path) si volume max ≥ WHALE_OBSERVE_MIN_SOL et sous plafond WHALE_AUTO_TABLE_MAX.
+   * Désactivé si WHALE_AUTO_OBSERVE=0.
+   * @returns true si nouvelle ligne insérée
+   */
+  ensureObservedBuyer(
+    address: string,
+    opts?: { discoveredVia?: string; label?: string; maxBuySol?: number },
+  ): boolean {
+    try {
+      if (process.env.WHALE_AUTO_OBSERVE === '0') return false;
+      if (!address || address === RESERVE_FLOW_TRADER) return false;
+      const minSol = envFloat('WHALE_OBSERVE_MIN_SOL', 0.1);
+      const maxTable = envInt('WHALE_AUTO_TABLE_MAX', 50_000);
+      const maxBuy = opts?.maxBuySol ?? minSol;
+      if (maxBuy < minSol) return false;
+      if (this.getWhaleCount() >= maxTable) return false;
+      if (this.isWhale(address)) return false;
+
+      this.addWhale(
+        address,
+        opts?.label ?? 'observed',
+        opts?.discoveredVia ?? 'curve_buyer',
+        0.35,
+      );
+      return this.isWhale(address);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Parcourt l’historique d’une courbe : max SOL acheté par wallet (hors synthetic) → ensureObservedBuyer.
+   * @returns true si au moins une nouvelle ligne a été ajoutée
+   */
+  observeBuyersFromTrades(trades: CurveTradeEvent[]): boolean {
+    try {
+      if (process.env.WHALE_AUTO_OBSERVE === '0') return false;
+      const byTrader = new Map<string, number>();
+      for (const t of trades) {
+        if (!t.isBuy || t.synthetic) continue;
+        if (t.trader === RESERVE_FLOW_TRADER) continue;
+        byTrader.set(t.trader, Math.max(byTrader.get(t.trader) ?? 0, t.solAmount));
+      }
+      let anyNew = false;
+      for (const [addr, maxSol] of byTrader) {
+        if (this.ensureObservedBuyer(addr, { maxBuySol: maxSol })) {
+          anyNew = true;
+        }
+      }
+      return anyNew;
+    } catch {
+      return false;
+    }
+  }
 
   addWhale(address: string, label: string, discoveredVia: string, trustScore = 0.5): void {
     try {

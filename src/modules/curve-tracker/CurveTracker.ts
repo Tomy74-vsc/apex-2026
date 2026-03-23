@@ -64,6 +64,7 @@ export class CurveTracker extends EventEmitter {
     creator: string,
     metadata?: { name?: string; symbol?: string; uri?: string },
     initialState?: BondingCurveState,
+    options?: { fromNarrativeWatchlist?: boolean },
   ): void {
     if (!this.tieredMonitor) return;
 
@@ -71,9 +72,22 @@ export class CurveTracker extends EventEmitter {
     const [bondingCurvePDA] = deriveBondingCurvePDA(mintPk);
     const creatorPk = new PublicKey(creator);
 
-    this.tieredMonitor.register(mint, bondingCurvePDA, creatorPk, metadata, initialState);
+    if (options?.fromNarrativeWatchlist) {
+      this.tieredMonitor.registerDirectWarm(
+        mint,
+        bondingCurvePDA,
+        creatorPk,
+        metadata,
+        initialState,
+        true,
+      );
+    } else {
+      this.tieredMonitor.register(mint, bondingCurvePDA, creatorPk, metadata, initialState);
+    }
     this.tradeHistory.set(mint, []);
-    console.log(`📝 [CurveTracker] Registered ${mint.slice(0, 8)}...`);
+    console.log(
+      `📝 [CurveTracker] Registered ${mint.slice(0, 8)}…${options?.fromNarrativeWatchlist ? ' (narrative watchlist → WARM)' : ''}`,
+    );
   }
 
   /**
@@ -117,6 +131,17 @@ export class CurveTracker extends EventEmitter {
   getHotCurves(): TrackedCurve[] {
     if (!this.tieredMonitor) return [];
     return Array.from(this.tieredMonitor.hot.values());
+  }
+
+  /** Toutes les courbes suivies (cold + warm + hot) — ex. matching NarrativeRadar. */
+  getAllTrackedCurves(): TrackedCurve[] {
+    if (!this.tieredMonitor) return [];
+    const { cold, warm, hot } = this.tieredMonitor;
+    return [
+      ...cold.values(),
+      ...warm.values(),
+      ...hot.values(),
+    ];
   }
 
   getStats(): { cold: number; warm: number; hot: number; total: number; evictions: number } {

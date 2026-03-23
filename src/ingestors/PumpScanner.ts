@@ -7,6 +7,8 @@ import WS from 'ws';
 type WsMessagePayload = string | Buffer | ArrayBuffer | Buffer[];
 import type { MarketEvent, TokenMetadata } from '../types/index.js';
 import { getCurveTracker } from '../modules/curve-tracker/CurveTracker.js';
+import { fetchDexSolanaTokenMeta } from './dexPumpMeta.js';
+import { getNarrativeRadar, type NarrativeSignal } from '../social/NarrativeRadar.js';
 import { KOTH_SOL_THRESHOLD } from '../constants/pumpfun.js';
 import { deriveBondingCurvePDA, decodeBondingCurve, type BondingCurveState } from '../types/bonding-curve.js';
 import { calcProgress } from '../math/curve-math.js';
@@ -397,7 +399,11 @@ export class PumpScanner extends EventEmitter {
       return;
     }
 
-    const tokenMetadata = { mint, symbol: 'PUMP', name: 'Pump Token', decimals: 6 };
+    let tokenMetadata: TokenMetadata = { mint, symbol: 'PUMP', name: 'Pump Token', decimals: 6 };
+    const dexMeta = await fetchDexSolanaTokenMeta(mint).catch(() => null);
+    if (dexMeta) {
+      tokenMetadata = { ...tokenMetadata, name: dexMeta.name, symbol: dexMeta.symbol };
+    }
     const creatorAddress = this.extractCreatorFromTransaction(tx);
 
     if (this.registeredMints.size >= this.MAX_MINT_CACHE) {
@@ -406,18 +412,43 @@ export class PumpScanner extends EventEmitter {
     }
     this.registeredMints.add(mint);
 
+    const radar = getNarrativeRadar();
+    let watchlistHit: NarrativeSignal | null = null;
+    try {
+      watchlistHit = radar.takeWatchlistMatchForNewMint(tokenMetadata.name, tokenMetadata.symbol);
+    } catch {
+      watchlistHit = null;
+    }
+
     const curveTracker = getCurveTracker();
     curveTracker.registerNewCurve(
       mint,
       creatorAddress,
       { name: tokenMetadata.name, symbol: tokenMetadata.symbol },
       decodedState,
+      { fromNarrativeWatchlist: watchlistHit != null },
     );
+
+    if (!watchlistHit) {
+      try {
+        const activeNarr = radar.matchesToken(tokenMetadata.name, tokenMetadata.symbol);
+        if (activeNarr) {
+          curveTracker.forcePromoteHot(mint);
+          console.log(
+            `📡 [NarrativeRadar] Étape 2 — nouveau mint HOT ← narratif actif "${activeNarr.theme}"`,
+          );
+        }
+      } catch {
+        /* cold path */
+      }
+    }
     this.statsInternal.registeredCurves++;
 
     console.log(
       `[PumpScanner] 🆕 Curve enregistrée: ${mint.slice(0, 8)}... | ` +
-      `${realSolSOL.toFixed(2)} SOL | progress ${(progress * 100).toFixed(1)}%`,
+      `${tokenMetadata.symbol} "${tokenMetadata.name.slice(0, 24)}${tokenMetadata.name.length > 24 ? '…' : ''}" | ` +
+      `${realSolSOL.toFixed(2)} SOL | progress ${(progress * 100).toFixed(1)}%` +
+      (watchlistHit ? ' | 📋 narrative watchlist → WARM' : ''),
     );
 
     const marketEvent: MarketEvent = {

@@ -3,11 +3,11 @@ import { getFeatureStore } from '../../data/FeatureStore.js';
 import type { TrackedCurve } from '../../types/bonding-curve.js';
 
 const PERSIST_DEBOUNCE_MS = 500;
-/** v2: same schema; bump forces re-save after spot-price scale fix (SOL/raw vs lamports/raw). */
-const STORED_VERSION = 2 as const;
+/** v3: partialTakeProfitDone + remainderPeakPriceSOL (trailing reliquat post-TP 50 %). */
+const STORED_VERSION = 3 as const;
 
 interface StoredCurvePositionV1 {
-  v: 1 | typeof STORED_VERSION;
+  v: 1 | 2 | typeof STORED_VERSION;
   id: string;
   mint: string;
   entryTimestamp: number;
@@ -28,6 +28,9 @@ interface StoredCurvePositionV1 {
   peakPriceSOL: number;
   /** If CLOSING at crash, reopen as OPEN so ExitEngine can retry. */
   persistedStatus?: 'OPEN' | 'CLOSING';
+  /** v3+ */
+  partialTakeProfitDone?: boolean;
+  remainderPeakPriceSOL?: number;
 }
 
 function persistEnabled(): boolean {
@@ -61,6 +64,10 @@ export interface CurvePosition {
   peakPriceSOL: number;
   peakPnlPct: number;
   maxDrawdownFromPeakPct: number;
+  /** Après SELL_50PCT : pic prix sur le reliquat uniquement (APEX §8). */
+  partialTakeProfitDone: boolean;
+  remainderPeakPriceSOL: number;
+  maxDrawdownFromRemainderPeakPct: number;
   status: CurvePositionStatus;
   exitReason: string | null;
   exitTimestamp: number | null;
@@ -159,6 +166,9 @@ export class PositionManager extends EventEmitter {
       peakPriceSOL: price,
       peakPnlPct: 0,
       maxDrawdownFromPeakPct: 0,
+      partialTakeProfitDone: false,
+      remainderPeakPriceSOL: 0,
+      maxDrawdownFromRemainderPeakPct: 0,
       status: 'OPEN',
       exitReason: null,
       exitTimestamp: null,
@@ -228,6 +238,18 @@ export class PositionManager extends EventEmitter {
     this.emit('positionUpdated', pos);
     this.schedulePersistOpenRows();
     return pos;
+  }
+
+  /**
+   * Après TP partiel 50 % réussi : active le trailing sur le reliquat (remainderPeakPriceSOL).
+   */
+  markPartialTakeProfit(mint: string): void {
+    const pos = this.open.get(mint);
+    if (!pos || (pos.status !== 'OPEN' && pos.status !== 'CLOSING')) return;
+    pos.partialTakeProfitDone = true;
+    pos.remainderPeakPriceSOL = pos.currentPriceSOL;
+    this.recomputePnl(pos);
+    this.schedulePersistOpenRows();
   }
 
   /** Full total SOL received (including any prior partials already in cumSolReceived). */
@@ -331,6 +353,8 @@ export class PositionManager extends EventEmitter {
       lastUpdated: p.lastUpdated,
       peakPriceSOL: p.peakPriceSOL,
       persistedStatus: p.status === 'CLOSING' ? 'CLOSING' : 'OPEN',
+      partialTakeProfitDone: p.partialTakeProfitDone,
+      remainderPeakPriceSOL: p.remainderPeakPriceSOL,
     };
     return JSON.stringify(row);
   }
@@ -338,7 +362,7 @@ export class PositionManager extends EventEmitter {
   private deserializeOpen(json: string): CurvePosition | null {
     try {
       const row = JSON.parse(json) as StoredCurvePositionV1;
-      if ((row.v !== 1 && row.v !== STORED_VERSION) || typeof row.mint !== 'string') {
+      if ((row.v !== 1 && row.v !== 2 && row.v !== STORED_VERSION) || typeof row.mint !== 'string') {
         return null;
       }
       const pos: CurvePosition = {
@@ -364,7 +388,13 @@ export class PositionManager extends EventEmitter {
         peakPriceSOL: row.peakPriceSOL,
         peakPnlPct: 0,
         maxDrawdownFromPeakPct: 0,
-        status: 'OPEN',
+        partialTakeProfitDone: row.partialTakeProfitDone === true,
+        remainderPeakPriceSOL:
+          typeof row.remainderPeakPriceSOL === 'number' && Number.isFinite(row.remainderPeakPriceSOL)
+            ? row.remainderPeakPriceSOL
+            : 0,
+        maxDrawdownFromRemainderPeakPct: 0,
+        status: row.persistedStatus === 'CLOSING' ? 'CLOSING' : 'OPEN',
         exitReason: null,
         exitTimestamp: null,
         exitSolReceived: null,
@@ -497,5 +527,18 @@ export class PositionManager extends EventEmitter {
 
     p.maxDrawdownFromPeakPct =
       p.peakPriceSOL > 1e-18 ? (p.peakPriceSOL - cur) / p.peakPriceSOL : 0;
+
+    if (p.partialTakeProfitDone) {
+      if (p.remainderPeakPriceSOL < 1e-18) {
+        p.remainderPeakPriceSOL = cur;
+      } else if (cur > p.remainderPeakPriceSOL) {
+        p.remainderPeakPriceSOL = cur;
+      }
+      p.maxDrawdownFromRemainderPeakPct =
+        p.remainderPeakPriceSOL > 1e-18 ? (p.remainderPeakPriceSOL - cur) / p.remainderPeakPriceSOL : 0;
+    } else {
+      p.remainderPeakPriceSOL = 0;
+      p.maxDrawdownFromRemainderPeakPct = 0;
+    }
   }
 }

@@ -1,10 +1,17 @@
 /**
  * Grok X Search — cold-path social overlay (Phase C).
  * Optional: no XAI_API_KEY → all calls return null, no throw.
- * Recherche live via `search_parameters` (API Responses xAI), pas via tool `x_search` non standard.
+ * POST /v1/responses avec outil `web_search` (latence serveur souvent 30–90 s+).
  */
 
 import { XAI_RESPONSES_WEB_TOOLS } from './xai-live-search.js';
+
+function responsesTimeoutMs(): number {
+  const v = process.env.XAI_RESPONSES_TIMEOUT_MS ?? process.env.GROK_X_FETCH_TIMEOUT_MS;
+  if (v === undefined || v === '') return 120_000;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) && n >= 15_000 ? n : 120_000;
+}
 
 export interface TokenXSentiment {
   mentionCount: number;
@@ -89,7 +96,7 @@ export class GrokXScanner {
           ],
           max_output_tokens: 1024,
         }),
-        signal: AbortSignal.timeout(25_000),
+        signal: AbortSignal.timeout(responsesTimeoutMs()),
       });
 
       const rawBody = await response.text();

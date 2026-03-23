@@ -56,6 +56,8 @@ export function getExitEngine(): ExitEngine {
 /**
  * Exit rule cascade — single pass, no allocations except returned ExitSignal.
  * Defaults alignés APEX_QUANT_STRATEGY §0.2 + §8 — profil Rotation (300s, stall 0.05 SOL/min × 90s).
+ * Ordre : graduation/SL/regression → hard time → (cooldown) → trailing reliquat post-TP50 OU trailing pré-TP
+ *   → velocity collapse → stall → soft time → TP partiel.
  */
 export class ExitEngine {
   private readonly stopLossPct: number;
@@ -68,6 +70,8 @@ export class ExitEngine {
   private readonly minCooldownMs: number;
   private readonly timeStopMinPGrad: number;
   private readonly hardMaxHoldMs: number;
+  /** Trailing sur reliquat après TP 50 % (pic prix remainder vs spot). */
+  private readonly trailingRemainderPct: number;
   private readonly lastEvalMs: Map<string, number> = new Map();
   private readonly stallLowSince: Map<string, number> = new Map();
 
@@ -86,9 +90,11 @@ export class ExitEngine {
     this.velocityCollapseRatio = envFloat('VELOCITY_COLLAPSE_RATIO', 0.3);
     this.minCooldownMs = envInt('EXIT_EVAL_COOLDOWN_MS', 3_000);
     this.timeStopMinPGrad = envFloat('TIME_STOP_MIN_PGRAD', 0.5);
+    this.trailingRemainderPct = envFloat('TRAILING_REMAINDER_PCT', 0.15);
 
     console.log(
       `🛡️ [ExitEngine] SL=${(this.stopLossPct * 100).toFixed(0)}% trail=${(this.trailingStopPct * 100).toFixed(0)}% ` +
+        `remainderTrail=${(this.trailingRemainderPct * 100).toFixed(0)}% ` +
         `TP=${(this.takeProfitPct * 100).toFixed(0)}% softTime=${(this.maxHoldMs / 1000).toFixed(0)}s ` +
         `hardMax=${(this.hardMaxHoldMs / 1000).toFixed(0)}s (NO BYPASS) ` +
         `stallSOL<${this.stallSolFlowMin}/min ×${(this.stallDurationMs / 1000).toFixed(0)}s ` +
@@ -150,7 +156,22 @@ export class ExitEngine {
     }
     this.lastEvalMs.set(mint, now);
 
-    if (position.peakPnlPct > 0.1 && position.maxDrawdownFromPeakPct > this.trailingStopPct) {
+    if (position.partialTakeProfitDone) {
+      if (
+        position.remainderPeakPriceSOL > 1e-18 &&
+        position.maxDrawdownFromRemainderPeakPct > this.trailingRemainderPct
+      ) {
+        this.stallLowSince.delete(mint);
+        return this.sig(
+          mint,
+          'trailing_stop',
+          'SELL_100PCT',
+          'HIGH',
+          `remainder trail ${(position.maxDrawdownFromRemainderPeakPct * 100).toFixed(1)}% > ${(this.trailingRemainderPct * 100).toFixed(0)}% (post-TP50)`,
+          pnlPct,
+        );
+      }
+    } else if (position.peakPnlPct > 0.1 && position.maxDrawdownFromPeakPct > this.trailingStopPct) {
       this.stallLowSince.delete(mint);
       return this.sig(
         mint,

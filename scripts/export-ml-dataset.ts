@@ -2,12 +2,19 @@
 /**
  * Export curve_snapshots / curve_outcomes / paper trades to CSV for Excel or training pipelines.
  * - curve_training_labeled.csv : snapshots HOT (features) JOIN outcomes (labels) — dataset supervisé principal
- * Usage: bun scripts/export-ml-dataset.ts [path/to/apex.db]
+ * Usage: bun scripts/export-ml-dataset.ts [path/to/apex.db] [--last-snapshot-per-mint]
+ * Env: EXPORT_ML_LAST_SNAPSHOT_ONLY=1 — même effet que le flag (dataset supervisé : 1 ligne / mint).
  */
 
 import { Database } from 'bun:sqlite';
 import { mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
+
+const argv = process.argv.slice(2);
+const lastSnapshotPerMint =
+  argv.includes('--last-snapshot-per-mint') ||
+  (process.env.EXPORT_ML_LAST_SNAPSHOT_ONLY ?? '').trim() === '1';
+const dbPath = argv.find((a) => !a.startsWith('-')) ?? 'data/apex.db';
 
 function csvCell(v: unknown): string {
   if (v === null || v === undefined) return '';
@@ -26,8 +33,11 @@ function rowsToCsv(rows: Record<string, unknown>[]): string {
   return lines.join('\n');
 }
 
-const dbPath = process.argv[2] ?? 'data/apex.db';
 const db = new Database(dbPath, { readonly: true, create: false });
+
+if (lastSnapshotPerMint) {
+  console.log('📦 [export:ml] Mode: dernière snapshot par mint (JOIN outcomes)');
+}
 
 try {
   const snapshots = db.query('SELECT * FROM curve_snapshots ORDER BY timestamp_ms DESC LIMIT 50000').all() as Record<
@@ -57,9 +67,27 @@ try {
   }
 
   try {
-    const labeled = db
-      .query(
-        `
+    const labeledSql = lastSnapshotPerMint
+      ? `
+      SELECT
+        s.*,
+        o.graduated AS label_graduated,
+        o.eviction_reason AS label_eviction_reason,
+        o.final_progress AS label_final_progress,
+        o.final_sol AS label_final_sol,
+        o.duration_s AS label_duration_s,
+        o.snapshots_count AS label_outcome_snapshot_count,
+        o.resolved_at AS label_resolved_at
+      FROM curve_snapshots s
+      INNER JOIN (
+        SELECT mint, MAX(timestamp_ms) AS max_ts
+        FROM curve_snapshots
+        GROUP BY mint
+      ) latest ON s.mint = latest.mint AND s.timestamp_ms = latest.max_ts
+      INNER JOIN curve_outcomes o ON s.mint = o.mint
+      LIMIT 100000
+    `
+      : `
       SELECT
         s.*,
         o.graduated AS label_graduated,
@@ -73,15 +101,14 @@ try {
       INNER JOIN curve_outcomes o ON s.mint = o.mint
       ORDER BY s.timestamp_ms DESC
       LIMIT 100000
-    `,
-      )
-      .all() as Record<string, unknown>[];
+    `;
+    const labeled = db.query(labeledSql).all() as Record<string, unknown>[];
     if (labeled.length > 0) {
       const out = 'data/curve_training_labeled.csv';
       await mkdir(dirname(out), { recursive: true });
       await Bun.write(out, rowsToCsv(labeled));
       console.log(
-        `✅ Exported ${labeled.length} labeled rows (snapshots+outcomes) → ${out} (supervisé ML)`,
+        `✅ Exported ${labeled.length} labeled rows (snapshots+outcomes) → ${out} (supervisé ML${lastSnapshotPerMint ? ', last snapshot / mint' : ''})`,
       );
     } else {
       console.log('⚠️ No labeled rows (need both curve_snapshots and curve_outcomes for same mints)');

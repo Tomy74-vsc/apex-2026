@@ -3,6 +3,11 @@ import { BotDetector, type BotSignal } from './BotDetector.js';
 import { WalletScorer, type WalletScore } from './WalletScorer.js';
 import { calcBreakevenWithConfidence } from './BreakevenCurve.js';
 import type { CurveTradeEvent, TrackedCurve } from '../../types/bonding-curve.js';
+import {
+  readCurveEntryMaxProgress,
+  readCurveEntryMinProgress,
+} from '../../constants/curve-entry-bands.js';
+import { getHolderDistributionOracle } from './HolderDistribution.js';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // APEX_QUANT_STRATEGY §5 — 7-signal weights (Marino + velocity momentum)
@@ -38,8 +43,6 @@ function envInt(key: string, def: number): number {
 const MIN_TRADING_INTENSITY = () => envFloat('MIN_TRADING_INTENSITY', 0.15);
 const VETO_BOT_RATIO = () => envFloat('VETO_BOT_RATIO', 0.7);
 const VETO_VELOCITY_RATIO = () => envFloat('VETO_VELOCITY_RATIO', 0.2);
-const CURVE_ENTRY_MIN_PROGRESS = () => envFloat('CURVE_ENTRY_MIN_PROGRESS', 0.45);
-const CURVE_ENTRY_MAX_PROGRESS = () => envFloat('CURVE_ENTRY_MAX_PROGRESS', 0.85);
 const VETO_MAX_AGE_MINUTES = () => envFloat('VETO_MAX_AGE_MINUTES', 45);
 const VETO_MIN_FRESH_PROGRESS = () => envFloat('VETO_MIN_FRESH_PROGRESS', 0.6);
 const MIN_TRADE_COUNT = () => envInt('MIN_TRADE_COUNT', 10);
@@ -82,10 +85,11 @@ export class GraduationPredictor {
     curve: TrackedCurve,
     trades: CurveTradeEvent[],
     socialScore = 0,
-    /** Réservé wiring app (social composite déjà fusionné dans socialScore). */
+    /** Réservé wiring app (social composite déjà fusionné dans socialScore, incl. booster Narrative Radar). */
     _grokEnriched = false,
     options?: { suppressEnterLog?: boolean },
   ): PredictionResult {
+    // Narratif Grok = pondération W_SOCIAL × socialNorm seulement — ne contourne pas les vétos ni le seuil breakeven+dynamique.
     const t0 = performance.now();
 
     const velocity = this.velocityAnalyzer.analyze(curve.mint, trades);
@@ -114,8 +118,8 @@ export class GraduationPredictor {
     let vetoReason: string | null = null;
     let vetoBucket: string | null = null;
 
-    const pMin = CURVE_ENTRY_MIN_PROGRESS();
-    const pMax = CURVE_ENTRY_MAX_PROGRESS();
+    const pMin = readCurveEntryMinProgress();
+    const pMax = readCurveEntryMaxProgress();
 
     if (walletScore.creatorIsSelling) {
       vetoReason = 'creator is selling (rug risk)';
@@ -180,13 +184,13 @@ export class GraduationPredictor {
     const velocityMomentumScore =
       Math.min(1, velocity.solPerMinute_1m / 3.0) * Math.max(0, Math.min(1, velocity.velocityRatio));
     const antiBotScore = 1 - botSignal.botTransactionRatio;
-    // APEX §5 holder quality: (1 − fresh) × (1 − top10Concentration/100); top10BuyVolumeShare est déjà 0–1
+    const onChainTop10 = getHolderDistributionOracle().getCachedShare(curve.mint);
+    const top10Conc =
+      onChainTop10 !== undefined ? onChainTop10 : walletScore.top10BuyVolumeShare;
+    // APEX §5 holder quality: (1 − fresh) × (1 − top10) ; top10 = supply top-10 si HOLDER_DISTRIBUTION_ENABLED, sinon proxy volume
     const holderScore = Math.max(
       0,
-      Math.min(
-        1,
-        (1 - walletScore.freshWalletRatio) * (1 - walletScore.top10BuyVolumeShare),
-      ),
+      Math.min(1, (1 - walletScore.freshWalletRatio) * (1 - top10Conc)),
     );
     const smartMoneyScore = Math.min(1, walletScore.smartMoneyBuyerCount / 3);
     const socialNorm = Math.max(0, Math.min(1, socialScore));
@@ -253,8 +257,8 @@ export class GraduationPredictor {
     const confidence = 0.15;
     const { minPGrad, minPGradWithMargin } = calcBreakevenWithConfidence(realSolLamports, confidence);
 
-    const pMin = CURVE_ENTRY_MIN_PROGRESS();
-    const pMax = CURVE_ENTRY_MAX_PROGRESS();
+    const pMin = readCurveEntryMinProgress();
+    const pMax = readCurveEntryMaxProgress();
     if (curve.progress < pMin || curve.progress > pMax) {
       this.bumpVeto('heuristic_progress_band');
       return {

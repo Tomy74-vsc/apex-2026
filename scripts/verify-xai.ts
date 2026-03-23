@@ -16,7 +16,8 @@ async function main(): Promise<void> {
     console.log('❌ XAI_API_KEY manquant dans .env');
     process.exit(1);
   }
-  console.log('🚀 Test GrokX (1 appel live search, ~10–30 s)…');
+  const toMs = parseInt(process.env.XAI_RESPONSES_TIMEOUT_MS ?? '120000', 10) || 120_000;
+  console.log(`🚀 Test GrokX (web_search côté xAI, timeout ${toMs / 1000}s — sois patient)…`);
   const r = await g.analyzeToken(ticker, mint);
   if (!r) {
     console.log('❌ Réponse null — voir logs ⚠️ [GrokX] ci-dessus (HTTP ou parse JSON)');

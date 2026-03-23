@@ -54,6 +54,8 @@ export interface TrackedCurve {
   hotSince?: number;
   /** Progress snapshot at HOT entry (stall detection). */
   progressAtHotEntry?: number;
+  /** True si la courbe a été enregistrée en WARM via pre-alert watchlist (narratif avant mint). */
+  narrativeMatch?: boolean;
 }
 
 /** Evenement de trade observe sur une bonding curve. */

@@ -37,9 +37,10 @@ import { GraduationExitStrategy } from './modules/curve-executor/GraduationExitS
 import { getPositionManager } from './modules/position/PositionManager.js';
 import { getExitEngine } from './modules/position/ExitEngine.js';
 import { getCurveVelocityAnalyzer } from './modules/position/curveVelocitySingleton.js';
+import { getHolderDistributionOracle } from './modules/graduation-predictor/HolderDistribution.js';
 import { attachPaperTradeLogger } from './modules/position/PaperTradeLogger.js';
 import { getGrokXScanner } from './social/GrokXScanner.js';
-import { getNarrativeRadar } from './social/NarrativeRadar.js';
+import { getNarrativeRadar, type NarrativeSignal } from './social/NarrativeRadar.js';
 import { getSentimentAggregator } from './social/SentimentAggregator.js';
 import { getViralityScorer } from './nlp/ViralityScorer.js';
 import { getNLPPipeline } from './nlp/NLPPipeline.js';
@@ -453,6 +454,11 @@ class APEXBot {
             await this.ensureSocialForHot(curve);
             const { score: obsSocial, grokEnriched: obsGrok } = this.getCachedCurveSocial(mint);
             this.decisionCore.appendHotObservationSnapshot(curve, trades, obsSocial, obsGrok);
+            try {
+              getHolderDistributionOracle().scheduleRefresh(mint);
+            } catch {
+              /* cold path */
+            }
           }
 
           if (pm.hasOpenPosition(mint) && this.curveExecutor) {
@@ -500,6 +506,7 @@ class APEXBot {
                     if (sellResult.success) {
                       if (exitSignal.action === 'SELL_50PCT') {
                         pm.applyPartialExit(mint, toSell, sellResult.solAmount);
+                        pm.markPartialTakeProfit(mint);
                       } else {
                         pm.closeWithFinalLeg(mint, exitSignal.reason, sellResult.solAmount);
                         getCurveVelocityAnalyzer().clear(mint);
@@ -554,6 +561,11 @@ class APEXBot {
             durationS,
           });
           this.enrichWhaleStatsFromCurveOutcome(mint, true);
+          try {
+            getHolderDistributionOracle().pruneMint(mint);
+          } catch {
+            /* cold path */
+          }
         } catch {
           // silencieux
         }
@@ -562,6 +574,10 @@ class APEXBot {
       // Outcomes : TieredMonitor évince puis émet snap capturé AVANT delete (getCurveState sinon null).
       curveTracker.on('evicted', (mint: string, reason: string, snap?: CurveEvictionSnapshot) => {
         try {
+          // handleGraduation émet `graduated` puis evict('graduated') : ne pas écraser labelCurveOutcome ni stats créateur.
+          if (reason === 'graduated') {
+            return;
+          }
           if (snap?.creator) {
             getAIBrain().recordCreatorOutcome(snap.creator, false);
           }
@@ -576,6 +592,11 @@ class APEXBot {
           });
           this.enrichWhaleStatsFromCurveOutcome(mint, false);
           this.decisionCore.clearCurveCooldown(mint);
+          try {
+            getHolderDistributionOracle().pruneMint(mint);
+          } catch {
+            /* cold path */
+          }
         } catch {
           // silencieux
         }
@@ -653,6 +674,41 @@ class APEXBot {
     return job;
   }
 
+  /** none | additive (défaut) | cap — cap = même maths + log si composite plafonné à 1 */
+  private narrativeSocialMode(): 'none' | 'additive' | 'cap' {
+    const m = (process.env.NARRATIVE_SOCIAL_MODE ?? 'additive').toLowerCase().trim();
+    if (m === 'none' || m === '0' || m === 'off') return 'none';
+    if (m === 'cap') return 'cap';
+    return 'additive';
+  }
+
+  /**
+   * Booster narratif uniquement sur le composite social (alimente W_SOCIAL × socialNorm dans GraduationPredictor).
+   * Plage Master Plan : ~7 % à 15 % — pas un trigger d'achat seul (vétos + breakeven margin inchangés).
+   */
+  private narrativeSocialBoostDelta(sig: NarrativeSignal): number {
+    const minB = parseFloat(process.env.NARRATIVE_SOCIAL_BOOST_MIN ?? '0.07');
+    const maxB = parseFloat(process.env.NARRATIVE_SOCIAL_BOOST_MAX ?? '0.15');
+    const lo = Number.isFinite(minB) ? Math.min(Math.max(minB, 0), 1) : 0.07;
+    const hi = Number.isFinite(maxB) ? Math.min(Math.max(maxB, lo), 1) : 0.15;
+    const span = Math.max(0.001, hi - lo);
+
+    const s = Math.max(
+      0,
+      Math.min(
+        1,
+        (sig.velocity / 10) * 0.35 +
+          (sig.mentionSpike / 10) * 0.35 +
+          Math.min(sig.verifiedSignals / 12, 1) * 0.2 +
+          sig.confidence * 0.1,
+      ),
+    );
+    let d = lo + span * s;
+    const tone = sig.toneShift.toLowerCase();
+    if (tone.includes('fomo') || tone.includes('euphor')) d = Math.min(hi, d + span * 0.12);
+    return Math.min(hi, Math.max(lo, d));
+  }
+
   private async doFetchAndCacheCurveSocialScore(curve: TrackedCurve): Promise<{
     score: number;
     grokEnriched: boolean;
@@ -687,11 +743,36 @@ class APEXBot {
       viralityScore,
       dexBoosted,
     );
-    if (narrativeMatch && narrativeMatch.velocity >= 7) {
-      socialScore = Math.min(1, socialScore + 0.3);
-      console.log(
-        `📢 [Narrative] ${mint.slice(0, 8)}… matches "${narrativeMatch.theme}" v=${narrativeMatch.velocity} → social boosted`,
-      );
+    const narrMode = this.narrativeSocialMode();
+    if (narrMode !== 'none') {
+      if (narrativeMatch) {
+        const delta = this.narrativeSocialBoostDelta(narrativeMatch);
+        if (delta > 0) {
+          const raw = socialScore + delta;
+          socialScore = Math.min(1, raw);
+          console.log(
+            `📢 [Narrative] ${mint.slice(0, 8)}… "${narrativeMatch.theme}" v=${narrativeMatch.velocity} spike=${narrativeMatch.mentionSpike} verified≈${narrativeMatch.verifiedSignals} → +${delta.toFixed(2)} social (cap narratif)`,
+          );
+          if (narrMode === 'cap' && raw > 1 + 1e-9) {
+            console.log(
+              `📢 [Narrative] ${mint.slice(0, 8)}… NARRATIVE_SOCIAL_MODE=cap — composite plafonné à 1 (raw=${raw.toFixed(3)})`,
+            );
+          }
+        }
+      } else if (curve.narrativeMatch) {
+        const minB = parseFloat(process.env.NARRATIVE_SOCIAL_BOOST_MIN ?? '0.07');
+        const floor = Number.isFinite(minB) ? Math.min(Math.max(minB, 0), 1) : 0.07;
+        const raw = socialScore + floor;
+        socialScore = Math.min(1, raw);
+        console.log(
+          `📢 [Narrative] ${mint.slice(0, 8)}… narrativeMatch (watchlist WARM) → +${floor.toFixed(2)} social (floor)`,
+        );
+        if (narrMode === 'cap' && raw > 1 + 1e-9) {
+          console.log(
+            `📢 [Narrative] ${mint.slice(0, 8)}… NARRATIVE_SOCIAL_MODE=cap — composite plafonné à 1 (raw=${raw.toFixed(3)})`,
+          );
+        }
+      }
     }
 
     this.curveSocialScoreCache.set(mint, {
@@ -706,8 +787,13 @@ class APEXBot {
   private enrichWhaleStatsFromCurveOutcome(mint: string, graduated: boolean): void {
     try {
       const trades = getCurveTracker().getTradeHistory(mint);
-      const earlyBuyers = trades.filter((t) => t.isBuy).map((t) => t.trader);
       const wdb = getWhaleWalletDB();
+      if (wdb.observeBuyersFromTrades(trades)) {
+        wdb.loadIntoSmartMoneyTracker();
+      }
+      const earlyBuyers = trades
+        .filter((t) => t.isBuy && !t.synthetic && t.trader !== '_reserve_flow')
+        .map((t) => t.trader);
       for (const buyer of new Set(earlyBuyers)) {
         wdb.updateStats(buyer, graduated);
       }
@@ -1036,7 +1122,9 @@ class APEXBot {
       console.log(
         `   xAI GrokX: ${gx.hasApiKey() ? 'clé OK' : 'sans clé'} | appels=${gxSt.calls} cache=${gxSt.cached} err=${gxSt.errors} avg=${gxSt.avgLatencyMs.toFixed(0)}ms`,
       );
-      console.log(`   NarrativeRadar: ${getNarrativeRadar().getActiveNarratives().length} thèmes actifs`);
+      console.log(
+        `   NarrativeRadar: ${getNarrativeRadar().getActiveNarratives().length} thèmes actifs, watchlist ${getNarrativeRadar().getWatchlistSize()}`,
+      );
       console.log(`   DexScreener boosts (mint set courant): ${getSocialTrendScanner().getBoostedMintCount()}`);
       console.log('');
       const ctStats = getCurveTracker().getStats();

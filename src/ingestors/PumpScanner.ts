@@ -24,6 +24,20 @@ const LAMPORTS_PER_SOL_N = 1_000_000_000;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Log WS complet avec api-key masquée (ne pas slice sur l’URL — sinon la clé semble « tronquée »). */
+function redactWsUrlForLog(raw: string): string {
+  if (!raw) return 'none';
+  try {
+    const u = new URL(raw);
+    if (u.searchParams.has('api-key')) {
+      u.searchParams.set('api-key', '***');
+    }
+    return u.toString();
+  } catch {
+    return raw.replace(/([?&]api-key=)[^&\s#]*/gi, '$1***');
+  }
+}
+
 /**
  * Événements émis par PumpScanner
  */
@@ -85,12 +99,24 @@ export class PumpScanner extends EventEmitter {
     this.maxGetTxRetries = this.isCurveMode ? 2 : 0;
 
     this.rpcUrl = options.rpcUrl || process.env.HELIUS_RPC_URL || process.env.RPC_URL || '';
-    const heliusWs = options.wsUrl || process.env.HELIUS_WS_URL || this.rpcUrl.replace('https://', 'wss://');
     const publicWs = 'wss://api.mainnet-beta.solana.com';
+    const derivedFromRpc = this.rpcUrl
+      ? this.rpcUrl.replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:')
+      : '';
 
-    const fromEnv = parseSolanaWsUrlsFromEnv();
-    this.wsEndpoints =
-      fromEnv.length > 0 ? fromEnv : [publicWs, heliusWs].filter(Boolean);
+    const wsOrdered: string[] = [];
+    const pushWs = (u: string | undefined) => {
+      const t = (u ?? '').trim();
+      if (t && !wsOrdered.includes(t)) wsOrdered.push(t);
+    };
+    if (options.wsUrl) pushWs(options.wsUrl);
+    pushWs(process.env.HELIUS_WS_URL);
+    pushWs(process.env.WS_URL);
+    for (const u of parseSolanaWsUrlsFromEnv()) pushWs(u);
+    if (derivedFromRpc) pushWs(derivedFromRpc);
+    pushWs(publicWs);
+
+    this.wsEndpoints = wsOrdered.length > 0 ? wsOrdered : [publicWs];
 
     if (!this.rpcUrl) {
       throw new Error('RPC URL must be provided via options or HELIUS_RPC_URL env var');
@@ -115,7 +141,10 @@ export class PumpScanner extends EventEmitter {
     console.log(`📊 Programme surveille: ${PUMP_PROGRAM_ID.toBase58()}`);
     console.log(`⚡ Mode: ${this.isCurveMode ? 'curve-prediction' : 'legacy'}`);
     console.log(`⚡ Commitment: ${commitment}`);
-    console.log(`🌐 WS endpoints: ${this.wsEndpoints.length} (primary: ${this.wsEndpoints[0]?.slice(0, 40)}...)`);
+    const primaryWs = this.wsEndpoints[0] ?? 'wss://api.mainnet-beta.solana.com';
+    console.log(
+      `🌐 [PumpScanner] WS: ${redactWsUrlForLog(primaryWs)} (+${Math.max(0, this.wsEndpoints.length - 1)} failover)`,
+    );
     if (this.isCurveMode) {
       console.log(`🔍 Min registration SOL: ${this.minRegistrationSOL}`);
     } else {
@@ -144,7 +173,7 @@ export class PumpScanner extends EventEmitter {
       });
 
       this.wsPool.on('open', (wsUrl: string) => {
-        console.log(`[PumpScanner] ✅ WS connected: ${wsUrl.slice(0, 50)}`);
+        console.log(`[PumpScanner] ✅ WS connected: ${redactWsUrlForLog(wsUrl)}`);
         const commitment = this.isCurveMode ? 'confirmed' : 'processed';
         const subId = this.rpcIdCounter++;
         this.wsPool?.send(
@@ -196,13 +225,14 @@ export class PumpScanner extends EventEmitter {
 
       this.wsPool.on('failover', (idx: number, nextUrl: string) => {
         this.statsInternal.wsReconnects++;
-        console.log(
-          `🔄 [PumpScanner] WS failover #${idx} → ${nextUrl.slice(0, 40)}…`,
-        );
+        console.log(`🔄 [PumpScanner] WS failover #${idx} → ${redactWsUrlForLog(nextUrl)}`);
       });
 
       this.wsPool.on('socketError', (err: Error) => {
-        console.warn(`⚠️  [PumpScanner] WS error: ${err.message?.slice(0, 80)}`);
+        const ep = redactWsUrlForLog(this.wsPool?.activeUrl ?? '');
+        console.warn(
+          `⚠️  [PumpScanner] WS error @ ${ep}: ${err.message?.slice(0, 160)}`,
+        );
       });
 
       this.wsPool.start();
@@ -661,7 +691,9 @@ export class PumpScanner extends EventEmitter {
       ...this.statsInternal,
       mode: this.isCurveMode ? 'curve-prediction' : 'legacy',
       minRegistrationSOL: this.minRegistrationSOL,
-      activeWsEndpoint: this.wsPool?.activeUrl.slice(0, 40) ?? this.wsEndpoints[0]?.slice(0, 40) ?? 'none',
+      activeWsEndpoint: redactWsUrlForLog(
+        this.wsPool?.activeUrl ?? this.wsEndpoints[0] ?? '',
+      ),
     };
   }
 }

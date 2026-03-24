@@ -3,7 +3,11 @@
  * Kelly / position size stay solely in AIBrain.decideCurve.
  */
 
-import type { FullCurveAnalysis, FullCurveAnalysisVerdict } from '../types/index.js';
+import type {
+  FullCurveAnalysis,
+  FullCurveAnalysisVerdict,
+  SecurityReport,
+} from '../types/index.js';
 import type { TrackedCurve, CurveTradeEvent } from '../types/bonding-curve.js';
 import type { VelocitySignal } from '../modules/graduation-predictor/VelocityAnalyzer.js';
 import { Guard } from './Guard.js';
@@ -76,6 +80,28 @@ export class CurveTokenAnalyzer {
   private readonly inflight = new Map<string, Promise<FullCurveAnalysis>>();
   private readonly progressBuf = new Map<string, number[]>();
 
+  /** Même sémantique que Guard.validateCurveForExecution : full on-chain+Jupiter uniquement si `1`. */
+  private static isCurveFullGuardEnabled(): boolean {
+    return (process.env.CURVE_FULL_GUARD ?? '').trim() === '1';
+  }
+
+  /** Pas d’appel Guard.analyzeToken — autres couches (holders, liquidité proxy, social) restent actives. */
+  private securityLayerSkipped(mint: string): SecurityReport {
+    return {
+      mint,
+      isSafe: true,
+      riskScore: 0,
+      flags: [],
+      details: {
+        mintRenounced: true,
+        freezeDisabled: true,
+        lpBurnedPercent: 0,
+        top10HoldersPercent: 0,
+        isHoneypot: false,
+      },
+    };
+  }
+
   getCached(mint: string): FullCurveAnalysis | null {
     const row = this.cache.get(mint);
     if (!row || Date.now() - row.at > CACHE_TTL_MS) return null;
@@ -117,7 +143,9 @@ export class CurveTokenAnalyzer {
     const mint = curve.mint;
 
     const run = async (): Promise<FullCurveAnalysis> => {
-      const securityP = layerTimeout(this.guard.analyzeToken(mint), SECURITY_LAYER_MS);
+      const securityP = CurveTokenAnalyzer.isCurveFullGuardEnabled()
+        ? layerTimeout(this.guard.analyzeToken(mint), SECURITY_LAYER_MS)
+        : Promise.resolve(this.securityLayerSkipped(mint));
       const holdersP = Promise.resolve().then(() => {
         const t0 = performance.now();
         const oracle = getHolderDistributionOracle().getCachedShare(mint);
@@ -376,10 +404,8 @@ export class CurveTokenAnalyzer {
     const realBuyCount = trades.filter((t) => t.isBuy && !t.synthetic).length;
     const botSnap = this.botDetector.analyze(trades);
 
-    // V0–V2b — sécurité (ordre lecture V1→V10)
-    if (!security) {
-      flags.push('V0_security_missing');
-    } else {
+    // V1–V2b — sécurité : absence de couche (timeout / erreur) = pas de véto ; seuls honeypot / risk explicites bloquent.
+    if (security) {
       if (!security.isSafe) flags.push('V1_not_safe');
       if (security.riskScore > maxRisk) flags.push('V2_risk_score');
       if (security.isHoneypot) flags.push('V2b_honeypot');
@@ -429,22 +455,30 @@ export class CurveTokenAnalyzer {
       flags.push('OPT_no_dex_pair');
     }
 
+    const securityReal = (process.env.CURVE_FULL_GUARD ?? '').trim() === '1';
+    const secWeight = securityReal ? 0.2 : 0.03;
+    /** Sans analyzeToken réel, holders/social ne doivent pas gonfler la confiance comme une preuve on-chain. */
+    const layerMult = securityReal ? 1 : 0.45;
+
     let compositeScore = 0.5;
     if (security) {
-      compositeScore += (1 - Math.min(1, security.riskScore / 100)) * 0.2;
+      compositeScore += (1 - Math.min(1, security.riskScore / 100)) * secWeight;
     }
     if (holders) {
-      compositeScore += (1 - holders.top10Share) * 0.15;
-      compositeScore += (1 - holders.freshWalletRatio) * 0.1;
+      compositeScore +=
+        ((1 - holders.top10Share) * 0.15 + (1 - holders.freshWalletRatio) * 0.1) * layerMult;
     }
     if (social && social.socialLayerComposite > 0) {
-      compositeScore += social.socialLayerComposite * 0.1;
+      compositeScore += social.socialLayerComposite * 0.1 * layerMult;
     }
     compositeScore = Math.max(0, Math.min(1, compositeScore));
 
     const finalPassed = flags.length === 0;
+    const rawPassedConf = Math.min(0.8, 0.32 + compositeScore * 0.48);
     const confidence = finalPassed
-      ? Math.min(0.8, 0.32 + compositeScore * 0.48)
+      ? securityReal
+        ? rawPassedConf
+        : Math.min(0.44, rawPassedConf)
       : 0.22;
 
     return {

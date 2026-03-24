@@ -10,6 +10,7 @@ import {
   KOTH_SOL_THRESHOLD,
 } from '../../constants/pumpfun.js';
 import { getPositionManager } from '../position/PositionManager.js';
+import { readCurveEntryMinProgress } from '../../constants/curve-entry-bands.js';
 
 const MAX_COLD = 5_000;
 const MAX_WARM = 200;
@@ -229,6 +230,11 @@ export class TieredMonitor extends EventEmitter {
     }
 
     if (curve.tier === 'hot') {
+      const minEntryProg = readCurveEntryMinProgress();
+      if (curve.progress < minEntryProg - 0.05) {
+        this.evict(mint, 'hot_progress_regressed');
+        return;
+      }
       if (ageMin > HOT_MAX_AGE_MIN) {
         this.evict(mint, 'hot_timeout_60min');
         return;

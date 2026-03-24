@@ -212,8 +212,9 @@ export class Guard {
       }
     } else {
       flags.push('HONEYPOT_CHECK_FAILED');
-      riskScore += 40;
-      isHoneypot = true;
+      riskScore += 25;
+      // Rejet / exception hors cas inconclus — ne pas traiter comme honeypot confirmé
+      isHoneypot = false;
     }
 
     if (liquidityResult.status === 'fulfilled') {
@@ -511,15 +512,38 @@ export class Guard {
         const swapTransactionBuf = Buffer.from(swapResponse.swapTransaction, 'base64');
         const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
 
-        const simulation = await this.rpcRace((conn) =>
-          conn.simulateTransaction(transaction, {
-            replaceRecentBlockhash: true,
-            sigVerify: false,
-          }),
-        );
+        let simulation: Awaited<
+          ReturnType<Connection['simulateTransaction']>
+        >;
+        try {
+          simulation = await this.rpcRace((conn) =>
+            conn.simulateTransaction(transaction, {
+              replaceRecentBlockhash: true,
+              sigVerify: false,
+            }),
+          );
+        } catch (e) {
+          const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
+          if (Guard.inconclusiveHoneypotMessage(msg)) {
+            console.log(
+              `⚠️ [Guard] Honeypot sim inconclusive (Token-2022 / TX build) — assuming safe (${(performance.now() - t0Honeypot).toFixed(0)}ms)`,
+            );
+            return false;
+          }
+          throw e;
+        }
 
-        // Si la simulation échoue, c'est probablement un honeypot
+        // Erreur RPC dans value.err (ex. sanitize accounts offsets) ≠ honeypot
         if (simulation.value.err) {
+          const errStr = JSON.stringify(simulation.value.err).toLowerCase();
+          const logsJoined = (simulation.value.logs ?? []).join(' ').toLowerCase();
+          const blob = `${errStr} ${logsJoined}`;
+          if (Guard.inconclusiveHoneypotMessage(blob)) {
+            console.log(
+              `⚠️ [Guard] Honeypot sim inconclusive (simulation err) — assuming safe (${(performance.now() - t0Honeypot).toFixed(0)}ms)`,
+            );
+            return false;
+          }
           console.log(
             `🛡️ [Guard] Honeypot check: ${(performance.now() - t0Honeypot).toFixed(2)}ms`,
           );

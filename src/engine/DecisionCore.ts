@@ -10,6 +10,7 @@ import type { TrackedCurve, CurveTradeEvent } from '../types/bonding-curve.js';
 import { evaluateEntryGates } from '../modules/entry/EntryFilter.js';
 import { getCurveVelocityAnalyzer } from '../modules/position/curveVelocitySingleton.js';
 import { getSentimentAggregator } from '../social/SentimentAggregator.js';
+import { getCurveTokenAnalyzer } from '../detectors/CurveTokenAnalyzer.js';
 
 /**
  * Événements émis par le DecisionCore (courbe uniquement)
@@ -140,9 +141,8 @@ export class DecisionCore extends EventEmitter {
 
   /**
    * Process a curve that entered the HOT zone.
-   * Pipeline: Guard → CurveTokenAnalyzer cache gate (when app passes `fullAnalysisGate`) → EntryFilter → AIBrain.decideCurve().
-   * Gate is not env-gated: if a cached `FullCurveAnalysis` is supplied and `verdict.passed === false` or action ≠ ENTER, skip immediately.
-   * If `fullAnalysisGate` is omitted or null (cache miss), this step is skipped — app should warm analysis in enterHotZone when strict gating is desired.
+   * Pipeline: Guard → CurveTokenAnalyzer gate (cache hit ou attente CURVE_ANALYZER_WAIT_MS) → EntryFilter → AIBrain.decideCurve().
+   * Cache miss: attend `analyze()` (même promesse que le warm enterHotZone) jusqu’au timeout, sinon SKIP conservateur.
    */
   async processCurveEvent(
     curve: TrackedCurve,
@@ -173,10 +173,38 @@ export class DecisionCore extends EventEmitter {
         return null;
       }
 
-      const fa = opts?.fullAnalysisGate;
-      if (fa && (!fa.verdict.passed || fa.verdict.recommendedAction !== 'ENTER')) {
+      const waitMs = Math.max(
+        1000,
+        parseInt(process.env.CURVE_ANALYZER_WAIT_MS ?? '6000', 10) || 6000,
+      );
+
+      let fa: FullCurveAnalysis | null =
+        opts?.fullAnalysisGate === undefined ? null : opts.fullAnalysisGate;
+
+      if (fa === null) {
+        try {
+          const vel = getCurveVelocityAnalyzer().analyze(curve.mint, trades);
+          fa = await Promise.race([
+            getCurveTokenAnalyzer().analyze(curve, vel, trades),
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), waitMs)),
+          ]);
+        } catch {
+          fa = null;
+        }
+        if (fa === null) {
+          console.log(
+            `⏱️ [DC] SKIP ${curve.mint.slice(0, 8)}… — analyzer timeout (>${waitMs}ms), too risky`,
+          );
+          return null;
+        }
+      }
+
+      if (!fa.verdict.passed || fa.verdict.recommendedAction !== 'ENTER') {
+        const vf = fa.verdict.vetoFlags?.length
+          ? ` vetos=${fa.verdict.vetoFlags.slice(0, 3).join(',')}`
+          : '';
         console.log(
-          `📊 [DC] ${curve.mint.slice(0, 8)}… SKIP — CurveTokenAnalyzer verdict: passed=${fa.verdict.passed} action=${fa.verdict.recommendedAction} (${(performance.now() - t0).toFixed(1)}ms)`,
+          `📊 [DC] ${curve.mint.slice(0, 8)}… SKIP — CurveTokenAnalyzer verdict: passed=${fa.verdict.passed} action=${fa.verdict.recommendedAction}${vf} (${(performance.now() - t0).toFixed(1)}ms)`,
         );
         return null;
       }

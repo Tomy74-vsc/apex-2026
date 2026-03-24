@@ -51,8 +51,8 @@ export function calcBreakevenWithConfidence(
 ): BreakevenResult {
   const base = calcBreakeven(realSolLamports, 1);
   const dynamicMult = safetyMarginFromConfidence(confidence);
-  /** Directive optional floor vs APEX dynamic margin — default 1 = no change. */
-  const baseFloor = envFloatMargin('SAFETY_MARGIN_BASE', 1);
+  /** Plancher APEX sur la marge dynamique — même défaut que `SAFETY_MARGIN_BASE ?? '1.50'`. */
+  const baseFloor = envFloatMargin('SAFETY_MARGIN_BASE', 1.5);
   /** Hot market: réduit le plancher effectif (max NARRATIVE_SAFETY_RELAX_MAX × momentum). */
   const relaxMax = envFloatMargin('NARRATIVE_SAFETY_RELAX_MAX', 0.08);
   const mom = Math.max(0, Math.min(1, options?.marketMomentum ?? 0));

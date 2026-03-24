@@ -1,5 +1,11 @@
 import { Connection, PublicKey, VersionedTransaction } from '@solana/web3.js';
-import { getMint, getAccount, TokenAccountNotFoundError, TokenInvalidAccountOwnerError } from '@solana/spl-token';
+import {
+  getAccount,
+  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
+  unpackMint,
+  type Mint,
+} from '@solana/spl-token';
 import { createJupiterApiClient, type QuoteResponse, type SwapResponse } from '@jup-ag/api';
 import type { SecurityReport } from '../types/index.js';
 import type { TrackedCurve } from '../types/bonding-curve.js';
@@ -318,14 +324,37 @@ export class Guard {
   }
 
   /**
-   * getMint avec rpcRace et gestion d'erreur silencieuse.
+   * Décode un mint SPL classique ou Token-2022 (Pump.fun post-2024) après vérif owner.
    */
-  private async safeGetMint(mintPubkey: PublicKey) {
+  private async getMintFromConnection(
+    conn: Connection,
+    mintAddress: PublicKey,
+  ): Promise<Mint | null> {
+    const info = await conn.getAccountInfo(mintAddress);
+    if (!info) return null;
+    const programs = [TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID];
+    for (const programId of programs) {
+      if (!info.owner.equals(programId)) continue;
+      try {
+        return unpackMint(mintAddress, info, programId);
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * getMint avec rpcRace — Token-2022 en premier, puis SPL Token legacy.
+   */
+  private async safeGetMint(mintPubkey: PublicKey): Promise<Mint | null> {
     try {
       const t0 = performance.now();
-      const mintInfo = await this.rpcRace((conn) => getMint(conn, mintPubkey));
+      const mintInfo = await this.rpcRace((conn) => this.getMintFromConnection(conn, mintPubkey));
       const ms = (performance.now() - t0).toFixed(2);
-      console.log(`🛡️ [Guard] Mint info: ${ms}ms`);
+      if (mintInfo) {
+        console.log(`🛡️ [Guard] Mint info: ${ms}ms`);
+      }
       return mintInfo;
     } catch (error) {
       console.warn('⚠️ [Guard] safeGetMint failed:', error);
@@ -403,6 +432,15 @@ export class Guard {
    * @param mintPubkey - PublicKey du mint
    * @returns true si honeypot détecté (swap échoue en simulation)
    */
+  private static inconclusiveHoneypotMessage(msg: string): boolean {
+    const m = msg.toLowerCase();
+    return (
+      m.includes('sanitize accounts') ||
+      m.includes('tokeninvalid') ||
+      m.includes('incorrectprogramid')
+    );
+  }
+
   private async detectHoneypot(mintPubkey: PublicKey): Promise<boolean> {
     const t0Honeypot = performance.now();
     try {
@@ -503,14 +541,26 @@ export class Guard {
         );
         return hasTransferError;
       } catch (error) {
-        // Erreur lors de la création/simulation = probable honeypot
+        const msg = error instanceof Error ? error.message : String(error);
+        if (Guard.inconclusiveHoneypotMessage(msg)) {
+          console.log(
+            `⚠️ [Guard] Honeypot sim inconclusive (Token-2022 / TX build) — assuming not honeypot (${(performance.now() - t0Honeypot).toFixed(0)}ms)`,
+          );
+          return false;
+        }
         console.log(
           `🛡️ [Guard] Honeypot check: ${(performance.now() - t0Honeypot).toFixed(2)}ms`,
         );
         return true;
       }
     } catch (error) {
-      // Si la simulation échoue complètement, on considère que c'est un honeypot
+      const msg = error instanceof Error ? error.message : String(error);
+      if (Guard.inconclusiveHoneypotMessage(msg)) {
+        console.log(
+          `⚠️ [Guard] Honeypot sim inconclusive — assuming not honeypot (${(performance.now() - t0Honeypot).toFixed(0)}ms)`,
+        );
+        return false;
+      }
       console.warn('Erreur lors de la simulation de swap:', error);
       console.log(
         `🛡️ [Guard] Honeypot check: ${(performance.now() - t0Honeypot).toFixed(2)}ms`,
@@ -728,7 +778,10 @@ export class Guard {
               // Offset 528: lpMint (32 bytes)
               const lpMint = new PublicKey(data.slice(528, 560));
 
-              const lpMintInfo = await this.rpcRace((conn) => getMint(conn, lpMint));
+              const lpMintInfo = await this.rpcRace((conn) =>
+                this.getMintFromConnection(conn, lpMint),
+              );
+              if (!lpMintInfo) continue;
               const totalSupply = lpMintInfo.supply;
 
               if (totalSupply === 0n) {

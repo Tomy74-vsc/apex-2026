@@ -47,6 +47,10 @@ import { getViralityScorer } from './nlp/ViralityScorer.js';
 import { getNLPPipeline } from './nlp/NLPPipeline.js';
 import type { TrackedCurve } from './types/bonding-curve.js';
 import type { MarketEvent } from './types/index.js';
+import {
+  readCurveEntryMinProgress,
+  readCurveEntryMaxProgress,
+} from './constants/curve-entry-bands.js';
 import { spawnSync } from 'node:child_process';
 
 /** Windows CMD/PowerShell often default to a legacy code page → UTF-8 logs become gibberish (ÔòÉ, D├®tection). */
@@ -1195,20 +1199,34 @@ function msToNextUtcMidnight(): number {
   return Math.max(1, next.getTime() - now.getTime());
 }
 
-/** Après validateEnv — clés alignées sur le code réel (pas d’invention de noms env). */
+/** Après validateEnv — valeurs affichées = défauts code si env absent (évite les « ? »). */
 function logLaunchConfig(): void {
   const e = process.env;
+  const ei = (k: string, d: number): number => {
+    const v = e[k];
+    if (v === undefined || v === '') return d;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : d;
+  };
+  const ef = (k: string, d: number): number => {
+    const v = e[k];
+    if (v === undefined || v === '') return d;
+    const n = parseFloat(v);
+    return Number.isFinite(n) ? n : d;
+  };
+  const maxConc =
+    ei('MAX_CONCURRENT_CURVE_POSITIONS', ei('MAX_CONCURRENT_POSITIONS', 5)) || 5;
   console.log(
     [
       '═══════════════════════════════════════════════',
       '🚀 APEX-2026 — Configuration de lancement',
       '═══════════════════════════════════════════════',
       `📊 Stratégie   : STRATEGY_MODE=${e.STRATEGY_MODE ?? 'curve-prediction'} | TRADING_MODE=${e.TRADING_MODE ?? 'paper'}`,
-      `📈 Entrée      : progress ${e.CURVE_ENTRY_MIN_PROGRESS ?? '?'}–${e.CURVE_ENTRY_MAX_PROGRESS ?? '?'} | MIN_TRADE_COUNT=${e.MIN_TRADE_COUNT ?? '?'} | MIN_MINUTES_IN_HOT=${e.MIN_MINUTES_IN_HOT ?? '?'}`,
-      `⛔ Vétos       : VETO_BOT_RATIO=${e.VETO_BOT_RATIO ?? '?'} | MIN_TRADING_INTENSITY=${e.MIN_TRADING_INTENSITY ?? '?'} | VETO_MAX_TOP10_PCT=${e.VETO_MAX_TOP10_PCT ?? '?'} | VETO_MAX_DEV_HOLDING=${e.VETO_MAX_DEV_HOLDING ?? '?'}`,
-      `🛡️  Sorties     : STOP_LOSS_PCT=${e.STOP_LOSS_PCT ?? '?'} | TRAILING_STOP_PCT=${e.TRAILING_STOP_PCT ?? '?'} | HARD_MAX_HOLD_SECONDS=${e.HARD_MAX_HOLD_SECONDS ?? '?'}`,
-      `💰 Risk        : MAX_CONCURRENT_CURVE_POSITIONS=${e.MAX_CONCURRENT_CURVE_POSITIONS ?? e.MAX_CONCURRENT_POSITIONS ?? '?'} | KELLY_FRACTION=${e.KELLY_FRACTION ?? '?'} | MIN_KELLY_FRACTION=${e.MIN_KELLY_FRACTION ?? '?'} | DAILY_LOSS_HALT_PCT=${e.DAILY_LOSS_HALT_PCT ?? '?'}`,
-      `🧠 Safety      : SAFETY_MARGIN_BASE=${e.SAFETY_MARGIN_BASE ?? '?'} | SAFETY_MARGIN_FLOOR=${e.SAFETY_MARGIN_FLOOR ?? '?'} | NARRATIVE_SAFETY_RELAX_MAX=${e.NARRATIVE_SAFETY_RELAX_MAX ?? '?'}`,
+      `📈 Entrée      : progress ${readCurveEntryMinProgress()}–${readCurveEntryMaxProgress()} | MIN_TRADE_COUNT=${ei('MIN_TRADE_COUNT', 10)} | MIN_MINUTES_IN_HOT=${ef('MIN_MINUTES_IN_HOT', 2)} | analyzerWaitMs=${ei('CURVE_ANALYZER_WAIT_MS', 6000)}`,
+      `⛔ Vétos       : VETO_BOT_RATIO=${ef('VETO_BOT_RATIO', 0.7)} | MIN_TRADING_INTENSITY=${ef('MIN_TRADING_INTENSITY', 0.15)} | VETO_MAX_TOP10_PCT=${ef('VETO_MAX_TOP10_PCT', 80)} | VETO_MAX_DEV_HOLDING=${ef('VETO_MAX_DEV_HOLDING', 15)}`,
+      `🛡️  Sorties     : STOP_LOSS_PCT=${ef('STOP_LOSS_PCT', 0.15)} | TRAILING_STOP_PCT=${ef('TRAILING_STOP_PCT', 0.2)} | HARD_MAX_HOLD_SECONDS=${ei('HARD_MAX_HOLD_SECONDS', 300)}`,
+      `💰 Risk        : MAX_CONCURRENT_CURVE_POSITIONS=${maxConc} | KELLY_FRACTION=${ef('KELLY_FRACTION', 0.25)} | MIN_KELLY_FRACTION=${ef('MIN_KELLY_FRACTION', 0.01)} | DAILY_LOSS_HALT_PCT=${ef('DAILY_LOSS_HALT_PCT', 0.15)}`,
+      `🧠 Safety      : SAFETY_MARGIN_BASE=${ef('SAFETY_MARGIN_BASE', 1.5)} | SAFETY_MARGIN_FLOOR=${ef('SAFETY_MARGIN_FLOOR', 1.2)} | NARRATIVE_SAFETY_RELAX_MAX=${ef('NARRATIVE_SAFETY_RELAX_MAX', 0.08)}`,
       '═══════════════════════════════════════════════',
     ].join('\n'),
   );

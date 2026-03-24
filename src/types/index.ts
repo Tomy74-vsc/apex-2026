@@ -245,3 +245,68 @@ export interface CurveSnapshotRecord {
   predictionMs: number;
   createdAt: number;
 }
+
+/**
+ * Analyse multi-couches pré-decideCurve (CurveTokenAnalyzer) — cache TTL 5 min.
+ * Verdict : gate avant AIBrain ; le Kelly final reste dans decideCurve uniquement.
+ */
+export interface FullCurveAnalysisVerdict {
+  passed: boolean;
+  recommendedAction: 'ENTER' | 'SKIP' | 'HOLD';
+  compositeScore: number;
+  /** [0,1] pour breakeven dynamique (GraduationPredictor) — dérivé du composite / veto. */
+  confidence: number;
+  vetoFlags: string[];
+  latencyMs: number;
+}
+
+export interface FullCurveAnalysis {
+  mint: string;
+  timestampMs: number;
+  /** true si timeout global 8s ou couches en échec partiel */
+  partial: boolean;
+  security: {
+    riskScore: number;
+    isSafe: boolean;
+    flags: string[];
+    isHoneypot: boolean;
+    latencyMs: number;
+  } | null;
+  holders: {
+    top10Share: number;
+    /** Alias directive — même valeur que top10Share (concentration top10). */
+    top10Concentration?: number;
+    freshWalletRatio: number;
+    creatorIsSelling: boolean;
+    creatorTokenCount: number;
+    creatorHistoricalGradRate: number;
+    /** Proxy dev accumulation: creator buy SOL / total buy SOL (wallet trades). */
+    creatorBuyVolumeShare: number;
+    /** Alias directive V7 — même valeur que creatorBuyVolumeShare. */
+    devHolding?: number;
+    latencyMs: number;
+  } | null;
+  liquidity: {
+    progressRegressing: boolean;
+    solPerMinuteHint: number;
+    botTransactionRatio: number;
+    latencyMs: number;
+  } | null;
+  social: {
+    dexPairFound: boolean;
+    /** Grok marché global [0,1] (NarrativeRadar, ~15min) — plus de Grok par token ici. */
+    narrativeMarketScore: number;
+    /** @deprecated alias = narrativeMarketScore pour rétrocompat / logs */
+    grokSentiment: number | null;
+    telegramScore: number;
+    dexBoostActive: boolean;
+    /** narrative×wN + telegram×wT + dex×wD (mêmes poids que SentimentAggregator). */
+    socialLayerComposite: number;
+    /** Heuristic keyword hits on DexScreener payload (directive V9). */
+    socialRedFlagHits: number;
+    /** Alias directive — même compteur que socialRedFlagHits. */
+    telegramRedFlags?: number;
+    latencyMs: number;
+  } | null;
+  verdict: FullCurveAnalysisVerdict;
+}

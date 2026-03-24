@@ -64,6 +64,10 @@ export class GrokXScanner {
     return this.apiKey.length > 0;
   }
 
+  /**
+   * Grok par mint (X sentiment token-level). Le pipeline social courbes utilise
+   * `NarrativeRadar` (marché global) — ne pas rappeler cette méthode sur chaque HOT mint.
+   */
   async analyzeToken(ticker: string, mintAddress: string): Promise<TokenXSentiment | null> {
     if (!this.apiKey) return null;
 

@@ -8,6 +8,13 @@ import {
   readCurveEntryMinProgress,
 } from '../../constants/curve-entry-bands.js';
 import { getHolderDistributionOracle } from './HolderDistribution.js';
+import type { FullCurveAnalysis } from '../../types/index.js';
+import { getNarrativeRadar } from '../../social/NarrativeRadar.js';
+
+export type PredictCurveOptions = {
+  suppressEnterLog?: boolean;
+  fullAnalysis?: FullCurveAnalysis | null;
+};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // APEX_QUANT_STRATEGY §5 — 7-signal weights (Marino + velocity momentum)
@@ -63,11 +70,18 @@ export interface PredictionResult {
   latencyMs: number;
 }
 
+export type GraduationVetoStatsReport = {
+  stats: Record<string, number>;
+  entryRate: string;
+};
+
 export class GraduationPredictor {
   private readonly velocityAnalyzer = new VelocityAnalyzer();
   private readonly botDetector = new BotDetector();
   private readonly walletScorer: WalletScorer;
   private readonly vetoStats = new Map<string, number>();
+  private totalPredictCalls = 0;
+  private totalFinalEnters = 0;
 
   constructor(smartMoneyAddresses?: Set<string>) {
     this.walletScorer = new WalletScorer(smartMoneyAddresses);
@@ -77,8 +91,23 @@ export class GraduationPredictor {
     this.vetoStats.set(bucket, (this.vetoStats.get(bucket) ?? 0) + 1);
   }
 
-  getVetoStats(): Record<string, number> {
-    return Object.fromEntries(this.vetoStats);
+  /** Vétos hors predict() (ex. Kelly trop faible dans AIBrain). */
+  recordVetoStat(reason: string): void {
+    this.bumpVeto(reason);
+  }
+
+  /** Entrée effective après Kelly + taille (une fois par decideCurve réussi). */
+  noteCurveEnterFinal(): void {
+    this.totalFinalEnters++;
+  }
+
+  getVetoStats(): GraduationVetoStatsReport {
+    const stats = Object.fromEntries(this.vetoStats);
+    const entryRate =
+      this.totalPredictCalls > 0
+        ? `${this.totalFinalEnters}/${this.totalPredictCalls} (${((this.totalFinalEnters / this.totalPredictCalls) * 100).toFixed(1)}%)`
+        : '0/0';
+    return { stats, entryRate };
   }
 
   predict(
@@ -87,10 +116,11 @@ export class GraduationPredictor {
     socialScore = 0,
     /** Réservé wiring app (social composite déjà fusionné dans socialScore, incl. booster Narrative Radar). */
     _grokEnriched = false,
-    options?: { suppressEnterLog?: boolean },
+    options?: PredictCurveOptions,
   ): PredictionResult {
     // Narratif Grok = pondération W_SOCIAL × socialNorm seulement — ne contourne pas les vétos ni le seuil breakeven+dynamique.
     const t0 = performance.now();
+    this.totalPredictCalls++;
 
     const velocity = this.velocityAnalyzer.analyze(curve.mint, trades);
     const botSignal = this.botDetector.analyze(trades);
@@ -113,7 +143,11 @@ export class GraduationPredictor {
     }
 
     /** APEX §6 — confiance scoring pondéré bornée [0.3, 0.8] (données trades wallet). */
-    const confidenceWeighted = Math.min(0.8, 0.3 + 0.7 * Math.min(1, buyCountWallet / 30));
+    let confidenceWeighted = Math.min(0.8, 0.3 + 0.7 * Math.min(1, buyCountWallet / 30));
+    const fa = options?.fullAnalysis;
+    if (fa?.verdict?.passed === true && !fa.partial && Number.isFinite(fa.verdict.confidence)) {
+      confidenceWeighted = Math.min(0.8, Math.max(confidenceWeighted, fa.verdict.confidence));
+    }
 
     // ─── APEX §5 V1–V5 (ordre strict) puis gates roadmapv3 ─────────────
     let vetoReason: string | null = null;
@@ -160,9 +194,11 @@ export class GraduationPredictor {
       vetoBucket = 'velocity_ratio';
     }
 
+    const marketMom = getNarrativeRadar().getGlobalMarketMomentum();
     const { minPGrad, minPGradWithMargin } = calcBreakevenWithConfidence(
       realSolLamports,
       confidenceWeighted,
+      { marketMomentum: marketMom },
     );
 
     if (vetoReason && vetoBucket) {
@@ -186,15 +222,30 @@ export class GraduationPredictor {
       Math.min(1, velocity.solPerMinute_1m / 3.0) * Math.max(0, Math.min(1, velocity.velocityRatio));
     const antiBotScore = 1 - botSignal.botTransactionRatio;
     const onChainTop10 = getHolderDistributionOracle().getCachedShare(curve.mint);
-    const top10Conc =
+    let top10Conc =
       onChainTop10 !== undefined ? onChainTop10 : walletScore.top10BuyVolumeShare;
+    if (fa?.holders && onChainTop10 === undefined) {
+      top10Conc = Math.max(0, Math.min(1, fa.holders.top10Share));
+    }
     // APEX §5 holder quality: (1 − fresh) × (1 − top10) ; top10 = supply top-10 si HOLDER_DISTRIBUTION_ENABLED, sinon proxy volume
     const holderScore = Math.max(
       0,
       Math.min(1, (1 - walletScore.freshWalletRatio) * (1 - top10Conc)),
     );
     const smartMoneyScore = Math.min(1, walletScore.smartMoneyBuyerCount / 3);
-    const socialNorm = Math.max(0, Math.min(1, socialScore));
+    let socialNorm = Math.max(0, Math.min(1, socialScore));
+    const faSocial = fa?.social;
+    if (faSocial) {
+      const layer =
+        faSocial.socialLayerComposite ??
+        faSocial.narrativeMarketScore ??
+        (faSocial.grokSentiment != null && Number.isFinite(faSocial.grokSentiment)
+          ? faSocial.grokSentiment
+          : null);
+      if (layer != null && Number.isFinite(layer)) {
+        socialNorm = Math.max(socialNorm, Math.max(0, Math.min(1, layer)));
+      }
+    }
     const progressSigmoid = 1 / (1 + Math.exp(-12 * (curve.progress - 0.55)));
 
     const numer =
@@ -252,11 +303,18 @@ export class GraduationPredictor {
     botSignal: BotSignal,
     walletScore: WalletScore,
     t0: number,
-    options?: { suppressEnterLog?: boolean },
+    options?: PredictCurveOptions,
   ): PredictionResult {
-    /** APEX §6 — heuristique sans trades : confiance basse ⇒ safety_margin ≈ 1.68× */
-    const confidence = 0.15;
-    const { minPGrad, minPGradWithMargin } = calcBreakevenWithConfidence(realSolLamports, confidence);
+    /** APEX §6 — heuristique sans trades (directive / AGENTS: 0.20). */
+    let confidence = 0.2;
+    const faH = options?.fullAnalysis;
+    if (faH?.verdict?.passed === true && !faH.partial && Number.isFinite(faH.verdict.confidence)) {
+      confidence = Math.min(0.8, Math.max(confidence, faH.verdict.confidence));
+    }
+    const marketMomH = getNarrativeRadar().getGlobalMarketMomentum();
+    const { minPGrad, minPGradWithMargin } = calcBreakevenWithConfidence(realSolLamports, confidence, {
+      marketMomentum: marketMomH,
+    });
 
     const pMin = readCurveEntryMinProgress();
     const pMax = readCurveEntryMaxProgress();
@@ -358,4 +416,11 @@ export class GraduationPredictor {
   clear(mint: string): void {
     this.velocityAnalyzer.clear(mint);
   }
+}
+
+let predictorSingleton: GraduationPredictor | null = null;
+
+export function getGraduationPredictor(): GraduationPredictor {
+  if (!predictorSingleton) predictorSingleton = new GraduationPredictor();
+  return predictorSingleton;
 }

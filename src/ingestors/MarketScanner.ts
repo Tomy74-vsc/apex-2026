@@ -1,3 +1,4 @@
+// DEPRECATED — legacy Raydium snipe path removed; STRATEGY_MODE is curve-prediction only. Kept for scripts/tests reference.
 import { Connection, PublicKey } from '@solana/web3.js';
 import type { VersionedTransactionResponse } from '@solana/web3.js';
 import { EventEmitter } from 'events';

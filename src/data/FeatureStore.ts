@@ -793,12 +793,19 @@ export class FeatureStore {
   }): void {
     if (this.isClosed) return;
     try {
+      const existing = this.db.prepare('SELECT mint FROM curve_outcomes WHERE mint = ?').get(opts.mint) as
+        | { mint: string }
+        | undefined;
+      if (existing) {
+        return;
+      }
+
       const snapCount = this.db.prepare(
         'SELECT COUNT(*) as cnt FROM curve_snapshots WHERE mint = ?',
       ).get(opts.mint) as { cnt: number } | null;
 
       this.db.prepare(`
-        INSERT OR REPLACE INTO curve_outcomes (
+        INSERT INTO curve_outcomes (
           mint, graduated, final_progress, final_sol, duration_s,
           eviction_reason, snapshots_count, created_at, resolved_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -816,7 +823,7 @@ export class FeatureStore {
 
       const emoji = opts.graduated ? '🎓' : '💀';
       console.log(
-        `${emoji} [FeatureStore] Outcome: ${opts.mint.slice(0, 8)} | ` +
+        `${emoji} [FeatureStore] Outcome (first-write): ${opts.mint.slice(0, 8)} | ` +
         `graduated=${opts.graduated} | progress=${(opts.finalProgress * 100).toFixed(1)}% | ` +
         `${opts.finalSol.toFixed(2)} SOL | ${opts.durationS.toFixed(0)}s | snapshots=${snapCount?.cnt ?? 0}`,
       );

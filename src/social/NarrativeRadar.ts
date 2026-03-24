@@ -60,6 +60,21 @@ function extractJsonArray(text: string): string | null {
   return null;
 }
 
+function extractJsonObject(text: string): string | null {
+  const start = text.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
 function normalizeName(s: string): string {
   return s
     .toLowerCase()
@@ -89,7 +104,12 @@ let singleton: NarrativeRadar | null = null;
 
 export class NarrativeRadar extends EventEmitter {
   private interval: ReturnType<typeof setInterval> | null = null;
+  private globalInterval: ReturnType<typeof setInterval> | null = null;
   private readonly SCAN_MS: number;
+  private readonly GLOBAL_SCAN_MS: number;
+  /** Snapshot Grok « marché global » (partagé tous les tokens, ~15min). */
+  private globalMarketSnapshot = { score: 0, updatedAt: 0, confidence: 0 };
+  private scanningGlobal = false;
   private readonly activeNarratives = new Map<string, NarrativeSignal>();
   /** Pre-alert : narratifs trending sans courbe trackée — match sur prochains mints Pump.fun. */
   private readonly narrativeWatchlist = new Map<
@@ -108,6 +128,11 @@ export class NarrativeRadar extends EventEmitter {
     this.baseUrl = (process.env.XAI_BASE_URL ?? 'https://api.x.ai/v1').replace(/\/$/, '');
     this.model = process.env.XAI_MODEL ?? 'grok-4-1-fast';
     this.SCAN_MS = parseInt(process.env.NARRATIVE_SCAN_INTERVAL_MS ?? '120000', 10);
+    /** Plancher 5 min — évite 1 min × 1440 appels xAI/jour si env mal réglée. */
+    this.GLOBAL_SCAN_MS = Math.max(
+      300_000,
+      parseInt(process.env.NARRATIVE_GLOBAL_SCAN_INTERVAL_MS ?? '900000', 10) || 900_000,
+    );
   }
 
   async start(): Promise<void> {
@@ -122,7 +147,123 @@ export class NarrativeRadar extends EventEmitter {
       void this.scanTrends().catch(() => {});
     }, this.SCAN_MS);
 
-    console.log(`🔍 [NarrativeRadar] Started — scanning X trends every ${this.SCAN_MS / 1000}s`);
+    void this.scanGlobalMarketMomentum().catch(() => {});
+    this.globalInterval = setInterval(() => {
+      void this.scanGlobalMarketMomentum().catch(() => {});
+    }, this.GLOBAL_SCAN_MS);
+
+    console.log(
+      `🔍 [NarrativeRadar] Started — theme scan ${this.SCAN_MS / 1000}s | global market Grok ${this.GLOBAL_SCAN_MS / 1000}s`,
+    );
+  }
+
+  /**
+   * Momentum marché Solana / Pump.fun [0,1] — dernier scan global (TTL voir NARRATIVE_GLOBAL_MOMENTUM_TTL_MS).
+   */
+  getGlobalMarketMomentum(): number {
+    const ttl = Math.max(
+      60_000,
+      parseInt(process.env.NARRATIVE_GLOBAL_MOMENTUM_TTL_MS ?? `${25 * 60_000}`, 10) || 25 * 60_000,
+    );
+    const now = Date.now();
+    if (now - this.globalMarketSnapshot.updatedAt > ttl) return 0;
+    return Math.max(0, Math.min(1, this.globalMarketSnapshot.score));
+  }
+
+  /** Âge du dernier snapshot global (ms), pour logs / grokEnriched. */
+  getGlobalMomentumAgeMs(): number {
+    if (this.globalMarketSnapshot.updatedAt <= 0) return Number.POSITIVE_INFINITY;
+    return Date.now() - this.globalMarketSnapshot.updatedAt;
+  }
+
+  private async scanGlobalMarketMomentum(): Promise<void> {
+    if (!this.apiKey || this.scanningGlobal) return;
+    this.scanningGlobal = true;
+    const t0 = performance.now();
+    try {
+      const response = await fetchWithTimeout(
+        `${this.baseUrl}/responses`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: this.model,
+            tools: XAI_RESPONSES_WEB_TOOLS,
+            input: [
+              {
+                role: 'system',
+                content:
+                  'You assess AGGREGATE Solana memecoin / Pump.fun market heat (not a single token). ' +
+                  'Use web_search. Return ONLY one JSON object, no markdown. Fields: marketMomentum 0-1 (0 dead, 1 extreme froth), confidence 0-1.',
+              },
+              {
+                role: 'user',
+                content:
+                  'Synthesize market-wide signals as if answering these angles in one judgment: ' +
+                  '(1) Solana meme coins trending right now, (2) Pump.fun graduation / migration activity, (3) Solana narrative today. ' +
+                  'Look at roughly the last 1-2 hours. ' +
+                  'JSON only: {"marketMomentum":0.5,"confidence":0.7}',
+              },
+            ],
+            max_output_tokens: 512,
+          }),
+        },
+        narrativeResponsesTimeoutMs(),
+      );
+
+      const rawBody = await response.text();
+      if (!response.ok) {
+        console.warn(
+          `⚠️  [NarrativeRadar:Global] HTTP ${response.status} — ${rawBody.slice(0, 200)}${rawBody.length > 200 ? '…' : ''}`,
+        );
+        return;
+      }
+
+      let data: Record<string, unknown>;
+      try {
+        data = JSON.parse(rawBody) as Record<string, unknown>;
+      } catch {
+        console.warn(`⚠️  [NarrativeRadar:Global] JSON parse error (${rawBody.length} chars)`);
+        return;
+      }
+      const blocks = (Array.isArray(data.output)
+        ? data.output
+        : Array.isArray(data.content)
+          ? data.content
+          : []) as Array<{ content?: Array<{ text?: string }>; text?: string }>;
+
+      let blob = '';
+      for (const block of blocks) {
+        blob += block?.content?.[0]?.text ?? block?.text ?? '';
+      }
+      if (!blob) blob = JSON.stringify(data);
+
+      const objText = extractJsonObject(blob);
+      if (!objText) return;
+
+      let o: Record<string, unknown>;
+      try {
+        o = JSON.parse(objText) as Record<string, unknown>;
+      } catch {
+        return;
+      }
+      const rawMom = Number(o.marketMomentum);
+      const rawConf = Number(o.confidence);
+      const marketMomentum = Number.isFinite(rawMom) ? Math.max(0, Math.min(1, rawMom)) : 0;
+      const confidence = Number.isFinite(rawConf) ? Math.max(0, Math.min(1, rawConf)) : 0.5;
+      const now = Date.now();
+      this.globalMarketSnapshot = { score: marketMomentum, updatedAt: now, confidence };
+      console.log(
+        `🌐 [NarrativeRadar:Global] marketMomentum=${marketMomentum.toFixed(2)} conf=${confidence.toFixed(2)} ⏱️${(performance.now() - t0).toFixed(0)}ms`,
+      );
+    } catch {
+      /* silent */
+    } finally {
+      this.scanningGlobal = false;
+    }
   }
 
   /**
@@ -415,6 +556,10 @@ export class NarrativeRadar extends EventEmitter {
     if (this.interval) {
       clearInterval(this.interval);
       this.interval = null;
+    }
+    if (this.globalInterval) {
+      clearInterval(this.globalInterval);
+      this.globalInterval = null;
     }
   }
 }

@@ -2,24 +2,32 @@
   "version": 1,
   "transcripts": {
     "C:\\Users\\tomre\\.cursor\\projects\\c-Users-tomre-bot-trading\\agent-transcripts\\02dcf70a-43cc-4647-93b2-1c43bdbe7b86\\02dcf70a-43cc-4647-93b2-1c43bdbe7b86.jsonl": {
-      "mtimeMs": 1774267930473,
-      "lastProcessedAt": "2026-03-23T14:00:00.000Z"
+      "mtimeMs": 1774270672390,
+      "lastProcessedAt": "2026-03-24T01:40:46.019Z"
+    },
+    "C:\\Users\\tomre\\.cursor\\projects\\c-Users-tomre-bot-trading\\agent-transcripts\\2c325f01-fcbd-484e-afbe-19ff71bffbef\\2c325f01-fcbd-484e-afbe-19ff71bffbef.jsonl": {
+      "mtimeMs": 1774271811649,
+      "lastProcessedAt": "2026-03-24T01:40:46.019Z"
     },
     "C:\\Users\\tomre\\.cursor\\projects\\c-Users-tomre-bot-trading\\agent-transcripts\\4ee35c48-83f1-4347-aef7-ff087c0635bf\\4ee35c48-83f1-4347-aef7-ff087c0635bf.jsonl": {
-      "mtimeMs": 1773908858369,
-      "lastProcessedAt": "2026-03-23T14:00:00.000Z"
+      "mtimeMs": 1773908858368,
+      "lastProcessedAt": "2026-03-24T01:40:46.019Z"
+    },
+    "C:\\Users\\tomre\\.cursor\\projects\\c-Users-tomre-bot-trading\\agent-transcripts\\69b936ad-335a-4e3c-930d-6958306774d1\\69b936ad-335a-4e3c-930d-6958306774d1.jsonl": {
+      "mtimeMs": 1774316378337,
+      "lastProcessedAt": "2026-03-24T01:40:46.019Z"
     },
     "C:\\Users\\tomre\\.cursor\\projects\\c-Users-tomre-bot-trading\\agent-transcripts\\a3b00837-0b23-4f96-8db1-092c0f31aed7\\a3b00837-0b23-4f96-8db1-092c0f31aed7.jsonl": {
-      "mtimeMs": 1773743609328,
-      "lastProcessedAt": "2026-03-23T14:00:00.000Z"
+      "mtimeMs": 1773743609327,
+      "lastProcessedAt": "2026-03-24T01:40:46.019Z"
     },
     "C:\\Users\\tomre\\.cursor\\projects\\c-Users-tomre-bot-trading\\agent-transcripts\\e863fcf7-4d16-45d4-acb9-35934f91d1cf\\e863fcf7-4d16-45d4-acb9-35934f91d1cf.jsonl": {
       "mtimeMs": 1773736534251,
-      "lastProcessedAt": "2026-03-23T14:00:00.000Z"
+      "lastProcessedAt": "2026-03-24T01:40:46.019Z"
     },
     "C:\\Users\\tomre\\.cursor\\projects\\c-Users-tomre-bot-trading\\agent-transcripts\\f87740c0-aacf-493d-8760-8ca28fafd3fd\\f87740c0-aacf-493d-8760-8ca28fafd3fd.jsonl": {
       "mtimeMs": 1773499638751,
-      "lastProcessedAt": "2026-03-23T14:00:00.000Z"
+      "lastProcessedAt": "2026-03-24T01:40:46.019Z"
     }
   }
 }

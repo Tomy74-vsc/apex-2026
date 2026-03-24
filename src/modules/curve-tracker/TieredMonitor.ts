@@ -200,6 +200,10 @@ export class TieredMonitor extends EventEmitter {
     }
   }
 
+  /**
+   * Rotation slots: HOT `hot_timeout_60min` + `hot_stalled_30min` (no open position).
+   * CurveTracker must listen to `evicted` / `graduated` to persist `curve_outcomes` — validate in paper that rows grow over ~2h.
+   */
   private demoteOrEvict(mint: string, curve: TrackedCurve): void {
     const now = Date.now();
     try {

@@ -7,6 +7,13 @@ import { calcExpectedReturnOnGraduation } from '../../math/curve-math.js';
 const LAMPORTS_PER_SOL = 1_000_000_000n;
 const BPS_BASE = 10_000n;
 
+function envFloatMargin(key: string, def: number): number {
+  const v = process.env[key];
+  if (v === undefined || v === '') return def;
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : def;
+}
+
 /**
  * Round-trip fee multiplier: buy fee + sell fee.
  * Each side = FEE_BASIS_POINTS / 10000 = 1.25%
@@ -39,9 +46,19 @@ export function safetyMarginFromConfidence(confidence: number): number {
 export function calcBreakevenWithConfidence(
   realSolLamports: bigint,
   confidence: number,
+  options?: { /** [0,1] momentum marché global (NarrativeRadar Grok ~15min) — assouplit légèrement le plancher SAFETY_MARGIN_BASE */
+    marketMomentum?: number },
 ): BreakevenResult {
   const base = calcBreakeven(realSolLamports, 1);
-  const mult = safetyMarginFromConfidence(confidence);
+  const dynamicMult = safetyMarginFromConfidence(confidence);
+  /** Directive optional floor vs APEX dynamic margin — default 1 = no change. */
+  const baseFloor = envFloatMargin('SAFETY_MARGIN_BASE', 1);
+  /** Hot market: réduit le plancher effectif (max NARRATIVE_SAFETY_RELAX_MAX × momentum). */
+  const relaxMax = envFloatMargin('NARRATIVE_SAFETY_RELAX_MAX', 0.08);
+  const mom = Math.max(0, Math.min(1, options?.marketMomentum ?? 0));
+  const floorMult = baseFloor * (1 - relaxMax * mom);
+  const safetyFloor = envFloatMargin('SAFETY_MARGIN_FLOOR', 1.2);
+  const mult = Math.max(dynamicMult, floorMult, safetyFloor);
   return {
     ...base,
     minPGradWithMargin: Math.min(1, base.minPGrad * mult),

@@ -87,8 +87,9 @@ export class Guard {
   }
 
   /**
-   * Analyse complète d'un token pour générer un SecurityReport
-   * 
+   * DEPRECATED — legacy snipe-at-T=0 entry path removed; bonding curves should orchestrate checks via
+   * `CurveTokenAnalyzer` (this body stays the single deep on-chain security pass, reused from that layer).
+   *
    * @param mint - Adresse publique du mint token
    * @returns SecurityReport avec riskScore et flags de sécurité
    */

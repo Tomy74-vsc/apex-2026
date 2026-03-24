@@ -22,7 +22,11 @@ import { getFeatureAssembler, type AssembledFeatures } from '../features/Feature
 import { getHawkesEvaluator } from './HawkesEvaluator.js';
 import { getKellyEngine, type PositionSizing } from '../risk/KellyEngine.js';
 import { getCVaRManager, type RiskMetrics } from '../risk/CVaRManager.js';
-import { GraduationPredictor, type PredictionResult } from '../modules/graduation-predictor/GraduationPredictor.js';
+import {
+  getGraduationPredictor,
+  type GraduationVetoStatsReport,
+  type PredictionResult,
+} from '../modules/graduation-predictor/GraduationPredictor.js';
 import { calcExpectedReturnOnGraduation } from '../math/curve-math.js';
 import type { TrackedCurve, CurveTradeEvent } from '../types/bonding-curve.js';
 
@@ -100,12 +104,11 @@ export class AIBrain extends EventEmitter {
     avgScore: 0,
   };
 
-  private graduationPredictor: GraduationPredictor;
   private readonly curveLoggedMints: Set<string> = new Set();
 
   constructor() {
     super();
-    this.graduationPredictor = new GraduationPredictor();
+    getGraduationPredictor();
     console.log('🧠 [AIBrain] Inference orchestrator initialized');
   }
 
@@ -279,11 +282,14 @@ export class AIBrain extends EventEmitter {
     trades: CurveTradeEvent[],
     socialScore = 0,
     grokEnriched = false,
+    fullAnalysis?: import('../types/index.js').FullCurveAnalysis | null,
   ): CurveDecision {
     const t0 = performance.now();
     this.stats.curveDecisions++;
 
-    const prediction = this.graduationPredictor.predict(curve, trades, socialScore, grokEnriched);
+    const prediction = getGraduationPredictor().predict(curve, trades, socialScore, grokEnriched, {
+      fullAnalysis: fullAnalysis ?? undefined,
+    });
 
     /** APEX §7 — multiplicateur sur f* (0.25 = quarter-Kelly). */
     const kellyEta = parseFloat(process.env.KELLY_FRACTION ?? '0.25');
@@ -306,6 +312,10 @@ export class AIBrain extends EventEmitter {
       const fApplied = Math.max(0, fStar * kellyEta);
 
       if (fApplied < minKellyFrac) {
+        getGraduationPredictor().recordVetoStat('kelly_too_small');
+        console.log(
+          `📊 [Predictor] SKIP ${curve.mint.slice(0, 8)}… | Kelly f*=${fApplied.toFixed(4)} < min=${minKellyFrac}`,
+        );
         action = 'SKIP';
       } else {
         const sized = Math.min(
@@ -318,6 +328,7 @@ export class AIBrain extends EventEmitter {
         } else {
           positionSol = Math.max(minPositionSol, sized);
           this.stats.curveEnters++;
+          getGraduationPredictor().noteCurveEnterFinal();
         }
       }
     }
@@ -357,7 +368,7 @@ export class AIBrain extends EventEmitter {
     socialScore = 0,
     grokEnriched = false,
   ): number {
-    return this.graduationPredictor.predict(curve, trades, socialScore, grokEnriched, {
+    return getGraduationPredictor().predict(curve, trades, socialScore, grokEnriched, {
       suppressEnterLog: true,
     }).pGrad;
   }
@@ -369,26 +380,27 @@ export class AIBrain extends EventEmitter {
     socialScore = 0,
     grokEnriched = false,
   ): PredictionResult {
-    return this.graduationPredictor.predict(curve, trades, socialScore, grokEnriched, {
+    return getGraduationPredictor().predict(curve, trades, socialScore, grokEnriched, {
       suppressEnterLog: true,
     });
   }
 
-  graduationVetoStats(): Record<string, number> {
-    return this.graduationPredictor.getVetoStats();
+  graduationVetoStats(): GraduationVetoStatsReport {
+    return getGraduationPredictor().getVetoStats();
   }
 
   /** Forward to GraduationPredictor for creator outcome tracking. */
   recordCreatorOutcome(creator: string, graduated: boolean): void {
-    this.graduationPredictor.recordCreatorOutcome(creator, graduated);
+    getGraduationPredictor().recordCreatorOutcome(creator, graduated);
   }
 
   /** Forward to GraduationPredictor smart money list. */
   setSmartMoneyList(addresses: string[]): void {
-    this.graduationPredictor.setSmartMoneyList(addresses);
+    getGraduationPredictor().setSmartMoneyList(addresses);
   }
 
   getStats() {
+    const gv = getGraduationPredictor().getVetoStats();
     return {
       ...this.stats,
       buyRate: this.stats.decisions > 0
@@ -397,7 +409,8 @@ export class AIBrain extends EventEmitter {
       curveEnterRate: this.stats.curveDecisions > 0
         ? (this.stats.curveEnters / this.stats.curveDecisions * 100).toFixed(1) + '%'
         : '0%',
-      graduationVetos: this.graduationPredictor.getVetoStats(),
+      graduationVetos: gv.stats,
+      graduationEntryRate: gv.entryRate,
     };
   }
 }

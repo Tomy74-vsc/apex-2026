@@ -4,8 +4,7 @@
  * APEX-2026 - Point d'entrée principal du Bot HFT Solana
  * 
  * Orchestre tous les composants :
- * - MarketScanner : Détection temps réel des nouveaux pools Raydium
- * - PumpScanner : Détection temps réel des nouveaux tokens Pump.fun
+ * - PumpScanner : Détection temps réel des nouveaux tokens Pump.fun (courbes)
  * - TelegramPulse : Signaux sociaux Telegram
  * - Guard : Analyse de sécurité on-chain
  * - DecisionCore : Scoring et décision de trade
@@ -25,7 +24,6 @@ import { getSocialTrendScanner } from './ingestors/SocialTrendScanner.js';
 import { Sniper } from './executor/Sniper.js';
 import { getFeatureStore } from './data/FeatureStore.js';
 import { getWhaleWalletDB } from './data/WhaleWalletDB.js';
-import { getPriceTracker } from './data/PriceTracker.js';
 import { getAIBrain, type CurveDecision } from './engine/AIBrain.js';
 import { getModelUpdater } from './engine/ModelUpdater.js';
 import { getShadowAgent } from './engine/ShadowAgent.js';
@@ -35,8 +33,11 @@ import type { CurveEvictionSnapshot } from './modules/curve-tracker/TieredMonito
 import { CurveExecutor } from './modules/curve-executor/CurveExecutor.js';
 import { GraduationExitStrategy } from './modules/curve-executor/GraduationExitStrategy.js';
 import { getPositionManager } from './modules/position/PositionManager.js';
+import { getPortfolioGuard } from './modules/risk/PortfolioGuard.js';
+import { getGraduationPredictor } from './modules/graduation-predictor/GraduationPredictor.js';
 import { getExitEngine } from './modules/position/ExitEngine.js';
 import { getCurveVelocityAnalyzer } from './modules/position/curveVelocitySingleton.js';
+import { getCurveTokenAnalyzer } from './detectors/CurveTokenAnalyzer.js';
 import { getHolderDistributionOracle } from './modules/graduation-predictor/HolderDistribution.js';
 import { attachPaperTradeLogger } from './modules/position/PaperTradeLogger.js';
 import { getGrokXScanner } from './social/GrokXScanner.js';
@@ -45,11 +46,7 @@ import { getSentimentAggregator } from './social/SentimentAggregator.js';
 import { getViralityScorer } from './nlp/ViralityScorer.js';
 import { getNLPPipeline } from './nlp/NLPPipeline.js';
 import type { TrackedCurve } from './types/bonding-curve.js';
-import type {
-  ScoredToken,
-  MarketEvent,
-  TokenEventRecord,
-} from './types/index.js';
+import type { MarketEvent } from './types/index.js';
 import { spawnSync } from 'node:child_process';
 
 /** Windows CMD/PowerShell often default to a legacy code page → UTF-8 logs become gibberish (ÔòÉ, D├®tection). */
@@ -124,9 +121,10 @@ class APEXBot {
   private pumpScanner: PumpScanner | null = null;
   private sniper: Sniper | null = null;
   private curveExecutor: CurveExecutor | null = null;
-  private readonly strategyMode: string;
   private stats: AppStats;
   private dashboardInterval: ReturnType<typeof setInterval> | null = null;
+  private evalInterval: ReturnType<typeof setInterval> | null = null;
+  private vetoStatsInterval: ReturnType<typeof setInterval> | null = null;
   private isShuttingDown: boolean = false;
   /** Phase B — throttled pGrad refresh for ExitEngine time-stop (ms). */
   private readonly livePGradRefreshMs = parseInt(process.env.LIVE_PGRAD_REFRESH_MS ?? '20000', 10) || 20_000;
@@ -143,8 +141,6 @@ class APEXBot {
   private socialFetchInflight = new Map<string, Promise<{ score: number; grokEnriched: boolean }>>();
 
   constructor(config: AppConfig) {
-    this.strategyMode = process.env.STRATEGY_MODE ?? 'legacy';
-
     // Initialise les statistiques
     this.stats = {
       tokensDetected: 0,
@@ -154,13 +150,11 @@ class APEXBot {
     };
 
     // Initialise CurveExecutor si en mode curve-prediction
-    if (this.strategyMode === 'curve-prediction') {
-      try {
-        this.curveExecutor = new CurveExecutor();
-        console.log('✅ CurveExecutor initialisé (paper=' + ((process.env.TRADING_MODE ?? 'paper') === 'paper') + ')');
-      } catch (error) {
-        console.error('⚠️  Erreur initialisation CurveExecutor:', error);
-      }
+    try {
+      this.curveExecutor = new CurveExecutor();
+      console.log('✅ CurveExecutor initialisé (paper=' + ((process.env.TRADING_MODE ?? 'paper') === 'paper') + ')');
+    } catch (error) {
+      console.error('⚠️  Erreur initialisation CurveExecutor:', error);
     }
 
     // Initialise TelegramPulse si les clés sont disponibles
@@ -235,94 +229,6 @@ class APEXBot {
    * Configure les handlers d'événements
    */
   private setupEventHandlers(): void {
-    // Événement : Token détecté par MarketScanner
-    this.decisionCore.on('tokenScored', (token: ScoredToken) => {
-      this.stats.tokensAnalyzed++;
-      console.log(`📊 Token scoré: ${token.token.symbol} (score: ${token.finalScore}, priority: ${token.priority})`);
-    });
-
-    // ── FeatureStore : enregistre chaque décision (cold path non-bloquant) ────
-    this.decisionCore.on('tokenScored', (token: ScoredToken) => {
-      try {
-        const store = getFeatureStore();
-        const record: TokenEventRecord = {
-          id: crypto.randomUUID(),
-          mint: token.token.mint,
-          t_source: token.t_source ?? token.timestamp ?? Date.now(),
-          t_recv: token.t_recv ?? Date.now(),
-          t_act: token.t_act ?? Date.now(),
-          featuresJson: '[]',
-          linearScore: token.finalScore,
-          onnxScore: null,
-          activeScore: token.finalScore,
-          shadowMode: 'linear_only',
-          liquiditySol: token.initialLiquiditySol,
-          riskScore: token.security.riskScore,
-          priority: token.priority,
-          decision: 'SKIP',
-          isFastCheck: false,
-          detectionMs: token.latency?.detectionMs ?? null,
-          guardMs: token.latency?.guardMs ?? null,
-          scoringMs: token.latency?.scoringMs ?? null,
-          totalMs: token.latency?.totalMs ?? null,
-          createdAt: Date.now(),
-        };
-        store.appendEvent(record);
-      } catch {
-        // cold path silencieux
-      }
-
-      // PriceTracker : programme les checks de prix multi-horizon (cold path)
-      try {
-        getPriceTracker().track(
-          token.token.mint,
-          token.initialPriceUsdc,
-          token.t_act ?? Date.now(),
-        );
-      } catch {
-        // silencieux
-      }
-    });
-
-    // Événement : Prêt à sniper
-    this.decisionCore.on('readyToSnipe', async (token: ScoredToken) => {
-      if (!this.sniper) {
-        console.log('⚠️  Token prêt mais Sniper non disponible');
-        return;
-      }
-
-      console.log(`\n🎯 PRÊT À SNIPER: ${token.token.symbol}`);
-      console.log(`   Mint: ${token.token.mint}`);
-      console.log(`   Score: ${token.finalScore}`);
-      console.log(`   Priority: ${token.priority}`);
-      console.log(`   Liquidité: ${token.initialLiquiditySol.toFixed(2)} SOL`);
-
-      try {
-        const signature = await this.sniper.executeSwap(token);
-
-        if (signature) {
-          this.stats.tokensSniped++;
-          console.log(`✅ Swap exécuté! Signature: ${signature}`);
-          console.log(`   Explorer: https://solscan.io/tx/${signature}`);
-        } else {
-          console.error('❌ Échec de l\'exécution du swap');
-        }
-      } catch (error) {
-        console.error('❌ Erreur lors du snipe:', error);
-      }
-    });
-
-    // Événement : Token rejeté
-    this.decisionCore.on('tokenRejected', (mint: string, reason: string) => {
-      // Log silencieux pour éviter spam
-    });
-
-    // Événement : Nouveau token détecté
-    this.decisionCore.on('tokenDetected', (mint: string) => {
-      this.stats.tokensDetected++;
-      // mint parameter available for future use (logging, debugging, etc.)
-    });
-
     // Événement : Signal Telegram détecté
     if (this.telegramPulse) {
       this.telegramPulse.on('newSignal', (signal) => {
@@ -352,7 +258,6 @@ class APEXBot {
           }
         })();
         console.log(`📨 TELEGRAM SIGNAL: ${signal.mint} (score: ${signal.score})`);
-        this.decisionCore.emit('tokenDetected', signal.mint);
         this.stats.tokensDetected++;
       });
 
@@ -363,27 +268,9 @@ class APEXBot {
 
     // Événement : Nouveau launch Pump.fun
     if (this.pumpScanner) {
-      if (this.strategyMode === 'curve-prediction') {
-        // V3.1: PumpScanner → CurveTracker (passive monitoring, no immediate snipe)
-        this.pumpScanner.on('newLaunch', (event: MarketEvent) => {
-          this.stats.tokensDetected++;
-        });
-      } else {
-        // Legacy: PumpScanner → DecisionCore (snipe at T=0)
-        this.pumpScanner.on('newLaunch', async (event: MarketEvent) => {
-          console.log(`🚀 [PumpScanner] NewLaunch: ${event.token.mint}`);
-          this.decisionCore.emit('tokenDetected', event.token.mint);
-          this.stats.tokensDetected++;
-          await this.decisionCore.processMarketEvent(event, false);
-        });
-
-        this.pumpScanner.on('fastCheck', async (event: MarketEvent) => {
-          console.log(`⚡ [PumpScanner] FastCheck: ${event.token.mint}`);
-          this.decisionCore.emit('tokenDetected', event.token.mint);
-          this.stats.tokensDetected++;
-          await this.decisionCore.processMarketEvent(event, true);
-        });
-      }
+      this.pumpScanner.on('newLaunch', (_event: MarketEvent) => {
+        this.stats.tokensDetected++;
+      });
 
       this.pumpScanner.on('error', (error) => {
         console.error('[PumpScanner] ❌ Erreur:', error);
@@ -394,8 +281,7 @@ class APEXBot {
     // V3.1 CurveTracker event wiring
     // ═══════════════════════════════════════════════════════════════════════════
 
-    if (this.strategyMode === 'curve-prediction') {
-      const curveTracker = getCurveTracker();
+    const curveTracker = getCurveTracker();
       const slipBps = parseInt(process.env.SLIPPAGE_BPS ?? '300', 10);
 
       attachPaperTradeLogger();
@@ -429,14 +315,18 @@ class APEXBot {
             return;
           }
           const trades = curveTracker.getTradeHistory(mint);
+          const vel = getCurveVelocityAnalyzer().analyze(mint, trades);
+          void getCurveTokenAnalyzer().analyze(curve, vel, trades).catch(() => {});
           const { score: socialScore, grokEnriched } = await this.fetchAndCacheCurveSocialScore(
             curve,
           ).catch(() => ({ score: 0, grokEnriched: false }));
+          const cached = getCurveTokenAnalyzer().getCached(mint);
           const decision = await this.decisionCore.processCurveEvent(
             curve,
             trades,
             socialScore,
             grokEnriched,
+            { fullAnalysisGate: cached },
           );
           await this.executeCurveBuyIfEnter(mint, curve, decision, slipBps);
         } catch (err) {
@@ -522,11 +412,14 @@ class APEXBot {
           if (!pm.hasOpenPosition(mint) && curve.tier === 'hot') {
             await this.ensureSocialForHot(curve);
             const { score: socialScore, grokEnriched } = this.getCachedCurveSocial(mint);
+            const vel = getCurveVelocityAnalyzer().analyze(mint, trades);
+            const cached = getCurveTokenAnalyzer().getCached(mint);
             const decision = await this.decisionCore.processCurveEvent(
               curve,
               trades,
               socialScore,
               grokEnriched,
+              { fullAnalysisGate: cached },
             );
             await this.executeCurveBuyIfEnter(mint, curve, decision, slipBps);
           }
@@ -560,6 +453,7 @@ class APEXBot {
             finalSol: curve.realSolSOL,
             durationS,
           });
+          console.log(`🎓 [Outcomes] graduated ${mint.slice(0, 8)}…`);
           this.enrichWhaleStatsFromCurveOutcome(mint, true);
           try {
             getHolderDistributionOracle().pruneMint(mint);
@@ -590,6 +484,7 @@ class APEXBot {
             durationS,
             evictionReason: reason,
           });
+          console.log(`📦 [Outcomes] evicted ${mint.slice(0, 8)}… reason=${reason}`);
           this.enrichWhaleStatsFromCurveOutcome(mint, false);
           this.decisionCore.clearCurveCooldown(mint);
           try {
@@ -601,7 +496,6 @@ class APEXBot {
           // silencieux
         }
       });
-    }
   }
 
   /**
@@ -717,11 +611,12 @@ class APEXBot {
     const meta = curve.metadata;
     const ticker = (meta?.symbol ?? 'UNKNOWN').replace(/^\$/, '');
 
-    const grok = getGrokXScanner();
-    const xSentiment = grok.hasApiKey()
-      ? await grok.analyzeToken(ticker, mint).catch(() => null)
-      : null;
-    const grokEnriched = xSentiment != null;
+    const narrRadar = getNarrativeRadar();
+    const narrativeMarketScore = narrRadar.getGlobalMarketMomentum();
+    const xaiOn = getGrokXScanner().hasApiKey();
+    const globalAge = narrRadar.getGlobalMomentumAgeMs();
+    /** Grok utilisé via NarrativeRadar (scan marché global), pas requête token-level. */
+    const grokEnriched = xaiOn && globalAge < 30 * 60_000;
 
     const tgClient = this.telegramPulse?.getClient() ?? null;
     let tgScan: TelegramTokenScanResult | null = null;
@@ -738,7 +633,7 @@ class APEXBot {
     const dexBoosted = getSocialTrendScanner().isBoosted(mint);
     let socialScore = getSentimentAggregator().computeComposite(
       mint,
-      xSentiment,
+      narrativeMarketScore,
       telegramChannelScore,
       viralityScore,
       dexBoosted,
@@ -809,7 +704,9 @@ class APEXBot {
       return { score: 0, grokEnriched: false };
     }
     if (getSocialTrendScanner().isBoosted(mint)) {
-      const dexOnly = getSentimentAggregator().computeComposite(mint, null, null, 0, true);
+      const dexOnly = getSentimentAggregator().computeComposite(mint, 0, null, 0, true, {
+        persist: false,
+      });
       return { score: Math.max(row.score, dexOnly), grokEnriched: row.grokEnriched };
     }
     return { score: row.score, grokEnriched: row.grokEnriched };
@@ -819,7 +716,7 @@ class APEXBot {
    * Démarre le bot
    */
   async start(): Promise<void> {
-    const modeLabel = this.strategyMode === 'curve-prediction' ? 'CURVE PREDICTION' : 'LEGACY SNIPE';
+    const modeLabel = 'CURVE PREDICTION';
     console.log('\n╔══════════════════════════════════════════════════════════╗');
     console.log(`║     APEX-2026 - Bot HFT Solana [${modeLabel}]      ║`);
     console.log('╚══════════════════════════════════════════════════════════╝\n');
@@ -829,58 +726,60 @@ class APEXBot {
       await this.decisionCore.start();
       console.log('✅ DecisionCore démarré\n');
 
-      /** En curve-prediction, PumpScanner appelle registerNewCurve → TieredMonitor doit exister avant le WS. */
-      let curvePipelineReady = this.strategyMode !== 'curve-prediction';
+      /** PumpScanner appelle registerNewCurve → TieredMonitor doit exister avant le WS. */
+      let curvePipelineReady = false;
 
-      // CurveTracker + sociaux AVANT PumpScanner (évite course : enregistrements perdus si tieredMonitor=null)
-      if (this.strategyMode === 'curve-prediction') {
-        try {
-          console.log('📈 Démarrage de CurveTracker...');
-          await getCurveTracker().start();
-          console.log('✅ CurveTracker démarré (mode: curve-prediction)\n');
+      try {
+        console.log('📈 Démarrage de CurveTracker...');
+        await getCurveTracker().start();
+        console.log('✅ CurveTracker démarré (mode: curve-prediction)\n');
 
-          if (!getGrokXScanner().hasApiKey()) {
-            console.log(
-              '⚠️ [Social] XAI_API_KEY unset — GrokX + NarrativeRadar off (bot OK sans couche X)\n',
-            );
-          }
-          void getNarrativeRadar()
-            .start()
-            .catch(() => {});
-
-          await getSocialTrendScanner().start();
-
-          const groqOn = !!(process.env.GROQ_API_KEY && process.env.GROQ_API_KEY.trim());
-          const xaiOn = getGrokXScanner().hasApiKey();
-          const tgSess = !!(process.env.TELEGRAM_SESSION_STRING && process.env.TELEGRAM_SESSION_STRING.trim());
-          const tm = process.env.TRADING_MODE ?? 'paper';
-          const te = process.env.TRADING_ENABLED === 'true';
+        if (!getGrokXScanner().hasApiKey()) {
           console.log(
-            `📡 [Pipeline] Groq NLP=${groqOn ? 'on' : 'off'} | xAI Grok/Narrative=${xaiOn ? 'on' : 'off'} | ` +
-              `DexScreener boosts=on | TG session=${tgSess ? 'oui (live)' : 'non → scan token via Dex proxy'}`,
+            '⚠️ [Social] XAI_API_KEY unset — GrokX + NarrativeRadar off (bot OK sans couche X)\n',
           );
-          console.log(
-            `📡 [Pipeline] Décisions HOT: social réhydraté si cache TTL ; achats/ventes: TRADING_MODE=${tm} | TRADING_ENABLED=${te} (live on-chain requiert les deux)`,
-          );
-
-          getFeatureStore();
-          getWhaleWalletDB().loadIntoSmartMoneyTracker();
-          const restored = getPositionManager().restoreFromFeatureStore();
-          if (restored > 0) {
-            this.decisionCore.syncActiveCurveSlotCount(getPositionManager().getOpenCount());
-          }
-          curvePipelineReady = true;
-        } catch (error) {
-          console.error('⚠️  Erreur lors du démarrage CurveTracker:', error);
-          console.log('⚠️  CurveTracker désactivé — PumpScanner ne sera pas lancé (curve-prediction)\n');
         }
-      } else {
-        console.log('⚠️  STRATEGY_MODE=' + this.strategyMode + ' (CurveTracker désactivé)\n');
+        void getNarrativeRadar()
+          .start()
+          .catch(() => {});
+
+        await getSocialTrendScanner().start();
+
+        const groqOn = !!(process.env.GROQ_API_KEY && process.env.GROQ_API_KEY.trim());
+        const xaiOn = getGrokXScanner().hasApiKey();
+        const tgSess = !!(process.env.TELEGRAM_SESSION_STRING && process.env.TELEGRAM_SESSION_STRING.trim());
+        const tm = process.env.TRADING_MODE ?? 'paper';
+        const te = process.env.TRADING_ENABLED === 'true';
+        console.log(
+          `📡 [Pipeline] Groq NLP=${groqOn ? 'on' : 'off'} | xAI Grok/Narrative=${xaiOn ? 'on' : 'off'} | ` +
+            `DexScreener boosts=on | TG session=${tgSess ? 'oui (live)' : 'non → scan token via Dex proxy'}`,
+        );
+        console.log(
+          `📡 [Pipeline] Décisions HOT: social réhydraté si cache TTL ; achats/ventes: TRADING_MODE=${tm} | TRADING_ENABLED=${te} (live on-chain requiert les deux)`,
+        );
+
+        getFeatureStore();
+        getWhaleWalletDB().loadIntoSmartMoneyTracker();
+        const restored = getPositionManager().restoreFromFeatureStore();
+        if (restored > 0) {
+          this.decisionCore.syncActiveCurveSlotCount(getPositionManager().getOpenCount());
+        }
+        curvePipelineReady = true;
+
+        try {
+          getPortfolioGuard().initDailyTracking(paperEquityApproxSol());
+          this.schedulePortfolioDailyResetUtc();
+        } catch {
+          /* cold path */
+        }
+      } catch (error) {
+        console.error('⚠️  Erreur lors du démarrage CurveTracker:', error);
+        console.log('⚠️  CurveTracker désactivé — PumpScanner ne sera pas lancé (curve-prediction)\n');
       }
 
       // Démarre PumpScanner (AVANT TelegramPulse qui peut bloquer)
       if (this.pumpScanner) {
-        if (this.strategyMode === 'curve-prediction' && !curvePipelineReady) {
+        if (!curvePipelineReady) {
           console.error(
             '❌ [Startup] PumpScanner ignoré : CurveTracker requis pour enregistrer les courbes (registerNewCurve).',
           );
@@ -919,17 +818,18 @@ class APEXBot {
 
       // Démarre le tableau de bord
       this.startDashboard();
+      this.startEvalLog();
+      this.startVetoStatsInterval();
 
       console.log('✅ Bot démarré avec succès!');
       console.log('📊 Tableau de bord mis à jour toutes les 60 secondes');
-      if (this.strategyMode === 'curve-prediction') {
-        console.log(
-          '📦 Collecte ML : snapshots HOT + outcomes grad/evict → `bun run export:ml` → data/*.csv (voir COLLECTION_RUNBOOK.md)',
-        );
-        console.log(
-          '💸 Infra : Helius/RPC + DexScreener + Groq ; xAI (Grok live) + Telegram = optionnels — test xAI : `bun run verify:xai`',
-        );
-      }
+      console.log('🔍 [EVAL] ligne agrégée toutes les 5 minutes (tiers + vétos prédicteur)');
+      console.log(
+        '📦 Collecte ML : snapshots HOT + outcomes grad/evict → `bun run export:ml` → data/*.csv (voir COLLECTION_RUNBOOK.md)',
+      );
+      console.log(
+        '💸 Infra : Helius/RPC + DexScreener + Groq ; xAI (Grok live) + Telegram = optionnels — test xAI : `bun run verify:xai`',
+      );
       console.log('🛑 Appuyez sur Ctrl+C pour arrêter proprement\n');
 
     } catch (error) {
@@ -955,23 +855,21 @@ class APEXBot {
     console.log('  (patience: WS Pump.fun / Telegram peuvent prendre 2-10 s)');
     console.log('------------------------------------------------------------');
 
-    if (this.strategyMode === 'curve-prediction') {
-      try {
-        getNarrativeRadar().stop();
-      } catch {
-        /* silencieux */
-      }
-      try {
-        getSocialTrendScanner().stop();
-      } catch {
-        /* silencieux */
-      }
-      try {
-        getPositionManager().flushPersistenceSync();
-        console.log('💾 [PositionManager] Open positions flushed to SQLite');
-      } catch {
-        /* silencieux */
-      }
+    try {
+      getNarrativeRadar().stop();
+    } catch {
+      /* silencieux */
+    }
+    try {
+      getSocialTrendScanner().stop();
+    } catch {
+      /* silencieux */
+    }
+    try {
+      getPositionManager().flushPersistenceSync();
+      console.log('💾 [PositionManager] Open positions flushed to SQLite');
+    } catch {
+      /* silencieux */
     }
 
     // Arrête le tableau de bord
@@ -979,25 +877,30 @@ class APEXBot {
       clearInterval(this.dashboardInterval);
       this.dashboardInterval = null;
     }
+    if (this.evalInterval) {
+      clearInterval(this.evalInterval);
+      this.evalInterval = null;
+    }
+    if (this.vetoStatsInterval) {
+      clearInterval(this.vetoStatsInterval);
+      this.vetoStatsInterval = null;
+    }
 
     // Affiche les statistiques finales
     this.displayDashboard(true);
 
-    // Arrête DecisionCore (qui arrête MarketScanner)
+    // Arrête DecisionCore
     try {
       await this.decisionCore.stop();
     } catch (error) {
       console.error('❌ Erreur lors de l\'arrêt du DecisionCore:', error);
     }
 
-    // Arrête CurveTracker
-    if (this.strategyMode === 'curve-prediction') {
-      try {
-        await getCurveTracker().stop();
-        console.log('✅ CurveTracker arrêté');
-      } catch (error) {
-        console.error('❌ Erreur lors de l\'arrêt CurveTracker:', error);
-      }
+    try {
+      await getCurveTracker().stop();
+      console.log('✅ CurveTracker arrêté');
+    } catch (error) {
+      console.error('❌ Erreur lors de l\'arrêt CurveTracker:', error);
     }
 
     // Arrête PumpScanner
@@ -1043,6 +946,66 @@ class APEXBot {
         this.displayDashboard();
       }
     }, 60000);
+  }
+
+  /** Agrégat léger 5 min — tiers + vétos (pas de throw si métrique manquante). */
+  private startEvalLog(): void {
+    this.evalInterval = setInterval(() => {
+      if (this.isShuttingDown) return;
+      try {
+        const tm = getCurveTracker().getStats();
+        const veto = getAIBrain().graduationVetoStats();
+        const top =
+          Object.entries(veto.stats)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 6)
+            .map(([k, v]) => `${k}=${v}`)
+            .join(' ') || 'N/A';
+        console.log(
+          `🔍 [EVAL] tiers c/w/h=${tm.cold}/${tm.warm}/${tm.hot} total=${tm.total} evict=${tm.evictions} | vetos: ${top}`,
+        );
+      } catch {
+        console.log('🔍 [EVAL] N/A (metrics)');
+      }
+    }, 300_000);
+  }
+
+  /** Stats singleton GraduationPredictor toutes les 30 min (checklist paper). */
+  private startVetoStatsInterval(): void {
+    this.vetoStatsInterval = setInterval(() => {
+      if (this.isShuttingDown) return;
+      try {
+        const { stats, entryRate } = getGraduationPredictor().getVetoStats();
+        const top = Object.entries(stats)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 5)
+          .map(([k, v]) => `${k}=${v}`)
+          .join(' | ');
+        console.log(`📊 [VetoStats] entryRate=${entryRate} | ${top || 'n/a'}`);
+      } catch {
+        /* silencieux */
+      }
+    }, 30 * 60 * 1000);
+  }
+
+  /**
+   * Reset bankroll jour + levée halt PortfolioGuard à minuit UTC (chaînage setTimeout).
+   */
+  private schedulePortfolioDailyResetUtc(): void {
+    const step = (): void => {
+      const delay = msToNextUtcMidnight();
+      setTimeout(() => {
+        if (!this.isShuttingDown) {
+          try {
+            getPortfolioGuard().initDailyTracking(paperEquityApproxSol());
+          } catch {
+            /* silencieux */
+          }
+        }
+        step();
+      }, delay);
+    };
+    step();
   }
 
   /**
@@ -1105,17 +1068,13 @@ class APEXBot {
     const brainStats = getAIBrain().getStats();
     console.log('🧠 AIBrain:');
     console.log(`   Snipe: ${brainStats.decisions} (BUY: ${brainStats.buys} / SKIP: ${brainStats.skips}) rate=${brainStats.buyRate}`);
-    if (this.strategyMode === 'curve-prediction') {
-      console.log(
-        `   Curve (decideCurve, apres EntryFilter+Guard): ${brainStats.curveDecisions} (ENTER: ${brainStats.curveEnters}) rate=${brainStats.curveEnterRate}`,
-      );
-    } else {
-      console.log(`   Curve: ${brainStats.curveDecisions} (ENTER: ${brainStats.curveEnters}) rate=${brainStats.curveEnterRate}`);
-    }
+    console.log(
+      `   Curve (decideCurve, apres EntryFilter+Guard): ${brainStats.curveDecisions} (ENTER: ${brainStats.curveEnters}) rate=${brainStats.curveEnterRate}`,
+    );
     console.log(`   Avg latency: ${brainStats.avgLatencyMs.toFixed(2)}ms | Avg score: ${brainStats.avgScore.toFixed(1)}`);
     console.log('');
 
-    if (this.strategyMode === 'curve-prediction') {
+    {
       const gx = getGrokXScanner();
       const gxSt = gx.getStats();
       console.log('🌐 Couche sociale (résumé):');
@@ -1188,7 +1147,7 @@ class APEXBot {
     console.log(`   Agreement: ${shadowStats.agreementRate.toFixed(1)}%`);
     console.log(`   Shadow trades: ${shadowStats.shadowTradesLogged}`);
     console.log('');
-    if (this.strategyMode === 'curve-prediction') {
+    {
       const csh = getCurveShadowAgent().getStats();
       console.log('👻 Curve Shadow (GraduationPredictor vs policy parallèle):');
       console.log(
@@ -1213,6 +1172,68 @@ class APEXBot {
    */
   getStats(): AppStats {
     return { ...this.stats };
+  }
+}
+
+/** Equity paper approx : PAPER_BANKROLL_SOL + PnL (réalisé + MTM). */
+function paperEquityApproxSol(): number {
+  const br = parseFloat(process.env.PAPER_BANKROLL_SOL ?? '1.0');
+  const base = Number.isFinite(br) && br > 0 ? br : 1;
+  try {
+    const s = getPositionManager().getPortfolioSummary();
+    return base + s.totalRealizedPnl + s.totalUnrealizedPnl;
+  } catch {
+    return base;
+  }
+}
+
+function msToNextUtcMidnight(): number {
+  const now = new Date();
+  const next = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0, 0),
+  );
+  return Math.max(1, next.getTime() - now.getTime());
+}
+
+/** Après validateEnv — clés alignées sur le code réel (pas d’invention de noms env). */
+function logLaunchConfig(): void {
+  const e = process.env;
+  console.log(
+    [
+      '═══════════════════════════════════════════════',
+      '🚀 APEX-2026 — Configuration de lancement',
+      '═══════════════════════════════════════════════',
+      `📊 Stratégie   : STRATEGY_MODE=${e.STRATEGY_MODE ?? 'curve-prediction'} | TRADING_MODE=${e.TRADING_MODE ?? 'paper'}`,
+      `📈 Entrée      : progress ${e.CURVE_ENTRY_MIN_PROGRESS ?? '?'}–${e.CURVE_ENTRY_MAX_PROGRESS ?? '?'} | MIN_TRADE_COUNT=${e.MIN_TRADE_COUNT ?? '?'} | MIN_MINUTES_IN_HOT=${e.MIN_MINUTES_IN_HOT ?? '?'}`,
+      `⛔ Vétos       : VETO_BOT_RATIO=${e.VETO_BOT_RATIO ?? '?'} | MIN_TRADING_INTENSITY=${e.MIN_TRADING_INTENSITY ?? '?'} | VETO_MAX_TOP10_PCT=${e.VETO_MAX_TOP10_PCT ?? '?'} | VETO_MAX_DEV_HOLDING=${e.VETO_MAX_DEV_HOLDING ?? '?'}`,
+      `🛡️  Sorties     : STOP_LOSS_PCT=${e.STOP_LOSS_PCT ?? '?'} | TRAILING_STOP_PCT=${e.TRAILING_STOP_PCT ?? '?'} | HARD_MAX_HOLD_SECONDS=${e.HARD_MAX_HOLD_SECONDS ?? '?'}`,
+      `💰 Risk        : MAX_CONCURRENT_CURVE_POSITIONS=${e.MAX_CONCURRENT_CURVE_POSITIONS ?? e.MAX_CONCURRENT_POSITIONS ?? '?'} | KELLY_FRACTION=${e.KELLY_FRACTION ?? '?'} | MIN_KELLY_FRACTION=${e.MIN_KELLY_FRACTION ?? '?'} | DAILY_LOSS_HALT_PCT=${e.DAILY_LOSS_HALT_PCT ?? '?'}`,
+      `🧠 Safety      : SAFETY_MARGIN_BASE=${e.SAFETY_MARGIN_BASE ?? '?'} | SAFETY_MARGIN_FLOOR=${e.SAFETY_MARGIN_FLOOR ?? '?'} | NARRATIVE_SAFETY_RELAX_MAX=${e.NARRATIVE_SAFETY_RELAX_MAX ?? '?'}`,
+      '═══════════════════════════════════════════════',
+    ].join('\n'),
+  );
+}
+
+/**
+ * Fail-fast env — paper ne requiert pas de wallet ; live + TRADING_ENABLED exigent clés.
+ */
+function validateEnv(): void {
+  const sm = process.env.STRATEGY_MODE?.trim();
+  if (sm && sm !== 'curve-prediction') {
+    throw new Error('STRATEGY_MODE doit être curve-prediction (snipe Raydium / MarketScanner retirés).');
+  }
+  if (!sm) {
+    process.env.STRATEGY_MODE = 'curve-prediction';
+  }
+  const tm = (process.env.TRADING_MODE ?? 'paper').toLowerCase();
+  const liveOn = tm === 'live' && process.env.TRADING_ENABLED === 'true';
+  if (liveOn) {
+    if (!(process.env.WALLET_PRIVATE_KEY ?? '').trim()) {
+      throw new Error('WALLET_PRIVATE_KEY requis pour TRADING_MODE=live et TRADING_ENABLED=true');
+    }
+    if (!(process.env.JITO_AUTH_PRIVATE_KEY ?? '').trim()) {
+      throw new Error('JITO_AUTH_PRIVATE_KEY requis pour exécution live (Jito)');
+    }
   }
 }
 
@@ -1310,7 +1331,8 @@ async function main() {
   });
 
   try {
-    // Charge la configuration
+    validateEnv();
+    logLaunchConfig();
     const config = loadConfig();
 
     // Crée et démarre le bot

@@ -56,8 +56,8 @@ export function getExitEngine(): ExitEngine {
 /**
  * Exit rule cascade — single pass, no allocations except returned ExitSignal.
  * Defaults alignés APEX_QUANT_STRATEGY §0.2 + §8 — profil Rotation (300s, stall 0.05 SOL/min × 90s).
- * Ordre : graduation/SL/regression → hard time → (cooldown) → trailing reliquat post-TP50 OU trailing pré-TP
- *   → velocity collapse → stall → soft time → TP partiel.
+ * Ordre : graduation → HARD time (no bypass) → SL → regression → cooldown → trailing → velocity collapse
+ *   → stall → soft time (livePGrad) → TP partiel.
  */
 export class ExitEngine {
   private readonly stopLossPct: number;
@@ -72,6 +72,10 @@ export class ExitEngine {
   private readonly hardMaxHoldMs: number;
   /** Trailing sur reliquat après TP 50 % (pic prix remainder vs spot). */
   private readonly trailingRemainderPct: number;
+  /** Drop vs entry progress triggering regression exit (directive: PROGRESS_DROP_VETO). */
+  private readonly progressDropVeto: number;
+  /** If 1, regression exit only when PnL < -5% (optional — can hide useful exits). */
+  private readonly progressDropRequireNegativePnl: boolean;
   private readonly lastEvalMs: Map<string, number> = new Map();
   private readonly stallLowSince: Map<string, number> = new Map();
 
@@ -91,6 +95,8 @@ export class ExitEngine {
     this.minCooldownMs = envInt('EXIT_EVAL_COOLDOWN_MS', 3_000);
     this.timeStopMinPGrad = envFloat('TIME_STOP_MIN_PGRAD', 0.5);
     this.trailingRemainderPct = envFloat('TRAILING_REMAINDER_PCT', 0.15);
+    this.progressDropVeto = envFloat('PROGRESS_DROP_VETO', 0.08);
+    this.progressDropRequireNegativePnl = process.env.PROGRESS_DROP_REQUIRE_NEGATIVE_PNL === '1';
 
     console.log(
       `🛡️ [ExitEngine] SL=${(this.stopLossPct * 100).toFixed(0)}% trail=${(this.trailingStopPct * 100).toFixed(0)}% ` +
@@ -98,7 +104,8 @@ export class ExitEngine {
         `TP=${(this.takeProfitPct * 100).toFixed(0)}% softTime=${(this.maxHoldMs / 1000).toFixed(0)}s ` +
         `hardMax=${(this.hardMaxHoldMs / 1000).toFixed(0)}s (NO BYPASS) ` +
         `stallSOL<${this.stallSolFlowMin}/min ×${(this.stallDurationMs / 1000).toFixed(0)}s ` +
-        `collapseRatio=${this.velocityCollapseRatio} timeStopSkipPGrad≥${this.timeStopMinPGrad} cooldown=${this.minCooldownMs}ms`,
+        `collapseRatio=${this.velocityCollapseRatio} timeStopSkipPGrad≥${this.timeStopMinPGrad} cooldown=${this.minCooldownMs}ms ` +
+        `progDrop≥${(this.progressDropVeto * 100).toFixed(0)}% pnlGate=${this.progressDropRequireNegativePnl ? 'on' : 'off'}`,
     );
   }
 
@@ -118,25 +125,10 @@ export class ExitEngine {
       return this.sig(mint, 'graduation', 'GRADUATION_EXIT_3TRANCHE', 'CRITICAL', 'curve complete / terminal progress', pnlPct);
     }
 
-    if (pnlPct < -this.stopLossPct) {
-      this.lastEvalMs.set(mint, now);
-      this.stallLowSince.delete(mint);
-      return this.sig(mint, 'stop_loss', 'SELL_100PCT', 'CRITICAL', `pnl ${(pnlPct * 100).toFixed(2)}% < -${(this.stopLossPct * 100).toFixed(0)}%`, pnlPct);
-    }
-
-    if (position.currentProgress < position.entryProgress - 0.1) {
-      this.lastEvalMs.set(mint, now);
-      this.stallLowSince.delete(mint);
-      return this.sig(
-        mint,
-        'progress_regression',
-        'SELL_100PCT',
-        'HIGH',
-        `progress ${(position.entryProgress * 100).toFixed(0)}% → ${(position.currentProgress * 100).toFixed(0)}%`,
-        pnlPct,
-      );
-    }
-
+    // HARD TIME STOP — aucun bypass possible (pas de livePGrad, pas de cooldown)
+    // APEX_QUANT_STRATEGY.md §8 : position 2 dans la cascade, avant tout soft exit.
+    // Le fallback heuristique retourne toujours pGrad > 0.5 sur curves > 50% →
+    // sans ce hard stop, le soft time stop ne fire jamais.
     if (now - position.entryTimestamp > this.hardMaxHoldMs) {
       this.lastEvalMs.set(mint, now);
       this.stallLowSince.delete(mint);
@@ -148,6 +140,27 @@ export class ExitEngine {
         `HARD time stop: held > ${(this.hardMaxHoldMs / 1000).toFixed(0)}s (NO bypass)`,
         pnlPct,
       );
+    }
+
+    if (pnlPct < -this.stopLossPct) {
+      this.lastEvalMs.set(mint, now);
+      this.stallLowSince.delete(mint);
+      return this.sig(mint, 'stop_loss', 'SELL_100PCT', 'CRITICAL', `pnl ${(pnlPct * 100).toFixed(2)}% < -${(this.stopLossPct * 100).toFixed(0)}%`, pnlPct);
+    }
+
+    if (position.currentProgress < position.entryProgress - this.progressDropVeto) {
+      if (!this.progressDropRequireNegativePnl || pnlPct < -0.05) {
+        this.lastEvalMs.set(mint, now);
+        this.stallLowSince.delete(mint);
+        return this.sig(
+          mint,
+          'progress_regression',
+          'SELL_100PCT',
+          'HIGH',
+          `progress ${(position.entryProgress * 100).toFixed(0)}% → ${(position.currentProgress * 100).toFixed(0)}% (drop>${(this.progressDropVeto * 100).toFixed(0)}%)`,
+          pnlPct,
+        );
+      }
     }
 
     const last = this.lastEvalMs.get(mint) ?? 0;
@@ -194,6 +207,9 @@ export class ExitEngine {
       }
     }
 
+    // STALL — uniquement solPerMinute_1m (pas de hasMicro ni dérivé)
+    // Intention : éviter les faux négatifs qui bloquent les slots indéfiniment.
+    // Toute condition sur tradesToReachCurrentLevel / peakVelocity doit être refusée.
     if (velocity.solPerMinute_1m < this.stallSolFlowMin) {
       const t0 = this.stallLowSince.get(mint);
       if (t0 === undefined) {
